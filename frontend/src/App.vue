@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), tasks = ref([]), messages = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({})
+const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), followLatest = ref(true), tasks = ref([]), messages = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({})
 const meta = { 'task-decomposer':['任务拆分','#8b5cf6',6,33], 'architecture-agent':['架构设计','#3b82f6',36,10], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,65], 'backend-agent':['后端开发','#0d9ab7',66,65], 'audit-agent':['代码审计','#dc981f',66,37], 'test-agent':['测试验证','#e15b93',6,65], 'deployment-agent':['部署发布','#374151',36,37] }
 const currentTask = agent => tasks.value.find(task => task.agent === agent.key)
 const complete = computed(() => tasks.value.filter(task => task.status === 'passed').length)
@@ -26,7 +26,8 @@ async function load() {
   try {
     agents.value = await fetch('/api/agents').then(response => response.json())
     workflows.value = await fetch('/api/workflows').then(response => response.json())
-    workflowId.value ||= workflows.value.at(-1)?.id || ''
+    if (followLatest.value) workflowId.value = workflows.value.at(-1)?.id || ''
+    else workflowId.value ||= workflows.value.at(-1)?.id || ''
     workflow.value = workflows.value.find(item => item.id === workflowId.value) || workflows.value.at(-1) || null
     workflowId.value = workflow.value?.id || ''
     const detail = workflow.value ? await fetch('/api/workflows/'+workflow.value.id).then(response => response.json()) : { tasks:[], messages:[] }
@@ -45,7 +46,7 @@ onUnmounted(() => clearInterval(timer))
       <div class="brand"><i class="live"></i>A2A Agent Office</div>
       <div class="task"><span>当前确认任务</span><strong>{{ workflow?.title || '等待 Codex 确认执行' }}</strong></div>
       <div class="metrics"><div><b>{{ complete }}/{{ tasks.length }}</b><small>已完成节点</small></div><div><b>{{ logs.length }}</b><small>上下文消息</small></div><div><b>{{ workflow?.status?.toUpperCase() || 'IDLE' }}</b><small>工作流状态</small></div></div>
-      <div class="controls"><select v-model="workflowId" @change="load"><option v-for="item in workflows" :key="item.id" :value="item.id">{{ item.title }} · {{ item.status }}</option></select><button @click="load">刷新</button></div>
+      <div class="controls"><select v-model="workflowId" @change="followLatest=false;load()"><option v-for="item in workflows" :key="item.id" :value="item.id">{{ item.title }} · {{ item.status }}</option></select><button @click="load">刷新</button></div>
     </header>
     <div class="layout">
       <section ref="floor" class="floor" :class="{ 'has-detail': selected }">

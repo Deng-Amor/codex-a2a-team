@@ -87,6 +87,19 @@ DEFAULT_STAGES = [
     ("acceptance", "product-agent", "test"),
     ("deploy", "deployment-agent", "acceptance"),
 ]
+FRONTEND_ONLY = [
+    ("decompose", "task-decomposer", ""),
+    ("frontend", "frontend-agent", "decompose"),
+    ("audit", "audit-agent", "frontend"),
+    ("test", "test-agent", "audit"),
+    ("acceptance", "product-agent", "test"),
+]
+
+
+def route_for(request: str):
+    normalized = request.replace(" ", "")
+    frontend_only = "前端" in normalized and any(flag in normalized for flag in ("后端数据不修改", "后端不修改", "接口不变", "数据库不修改"))
+    return ("frontend_only", FRONTEND_ONLY) if frontend_only else ("full", DEFAULT_STAGES)
 
 app = FastAPI(title="A2A Control Plane")
 app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
@@ -139,11 +152,13 @@ def add_stage(stage: dict, session: Session = Depends(db)):
 def create_workflow(payload: dict, session: Session = Depends(db)):
     workflow_id = "wf_" + uuid4().hex[:8]
     session.add(Workflow(id=workflow_id, title=payload["title"], request=payload["request"]))
-    for stage in session.scalars(select(Stage)):
-        session.add(Task(id=f"{workflow_id}_{stage.key}", workflow_id=workflow_id, stage_key=stage.key, agent_key=stage.agent_key, status="ready" if not stage.depends_on else "blocked", depends_on=stage.depends_on))
-    session.add(Message(workflow_id=workflow_id, task_id=f"{workflow_id}_decompose", from_agent="codex", to_agent="task-decomposer", text="需求已确认，开始任务拆分。"))
+    route, stages = route_for(payload["request"])
+    for key, agent, dependencies in stages:
+        session.add(Task(id=f"{workflow_id}_{key}", workflow_id=workflow_id, stage_key=key, agent_key=agent, status="ready" if not dependencies else "blocked", depends_on=dependencies))
+    summary = "仅激活前端、审计、测试与验收链路；架构、后端、部署不适用。" if route == "frontend_only" else "需求已确认，开始任务拆分。"
+    session.add(Message(workflow_id=workflow_id, task_id=f"{workflow_id}_decompose", from_agent="codex", to_agent="task-decomposer", text=summary))
     session.commit()
-    return {"id": workflow_id, "status": "running"}
+    return {"id": workflow_id, "status": "running", "route": route}
 
 
 @app.get("/api/workflows")

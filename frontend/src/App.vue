@@ -2,17 +2,31 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), followLatest = ref(true), tasks = ref([]), messages = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({})
-const meta = { 'task-decomposer':['任务拆分','#8b5cf6',6,33], 'architecture-agent':['架构设计','#3b82f6',36,10], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,65], 'backend-agent':['后端开发','#0d9ab7',66,65], 'audit-agent':['代码审计','#dc981f',66,37], 'test-agent':['测试验证','#e15b93',6,65], 'deployment-agent':['部署发布','#374151',36,37] }
-const currentTask = agent => tasks.value.find(task => task.agent === agent.key)
+const meta = { 'team-lead':['Team Lead','#172554',6,9], 'contract-audit':['方案审计','#dc981f',36,10], 'task-decomposer':['任务拆分','#8b5cf6',6,38], 'architecture-agent':['架构设计','#3b82f6',36,31], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,66], 'backend-agent':['后端开发','#0d9ab7',66,66], 'audit-agent':['代码审计','#dc981f',66,40], 'test-agent':['测试验证','#e15b93',6,66], 'deployment-agent':['部署发布','#374151',36,40] }
+const virtualNodes = [{ key:'team-lead', name:'Team Lead', role:'lead' }, { key:'contract-audit', name:'方案审计', role:'contract audit' }]
+const currentTask = agent => {
+  if (agent.key === 'team-lead') return tasks.value.find(task => /(^|[-_])lead|plan|contract/.test(task.stage) || /team[-_]?lead/.test(task.agent))
+  if (agent.key === 'contract-audit') return tasks.value.find(task => /contract.*audit|audit.*contract|pre[-_]?audit/.test(task.stage))
+  return tasks.value.find(task => task.agent === agent.key)
+}
 const complete = computed(() => tasks.value.filter(task => task.status === 'passed').length)
 const logs = computed(() => messages.value)
-const displayAgents = computed(() => agents.value.filter(agent => tasks.value.some(task => task.agent === agent.key)))
+const displayAgents = computed(() => {
+  const active = agents.value.filter(agent => tasks.value.some(task => task.agent === agent.key))
+  const lead = active.some(agent => /team[-_]?lead/.test(agent.key))
+  const gate = active.some(agent => /contract.*audit|audit.*contract/.test(agent.key))
+  return [...(lead ? [] : [virtualNodes[0]]), ...(gate ? [] : [virtualNodes[1]]), ...active]
+})
 const position = (agent, index) => { const saved = meta[agent.key]; return saved ? { left:saved[2]+'%', top:saved[3]+'%' } : { left:(8+(index%3)*29)+'%', top:(10+Math.floor(index/3)*25)+'%' } }
 const color = agent => meta[agent.key]?.[1] || '#64748b'
 const label = agent => meta[agent.key]?.[0] || agent.name
 const taskAgent = task => agents.value.find(agent => agent.key === task.agent) || { key:task.agent, name:task.agent }
 const endpoint = task => { const point = position(taskAgent(task), 0); return [Number.parseFloat(point.left)+8, Number.parseFloat(point.top)+8] }
+const wireLinks = computed(() => tasks.value.flatMap(task => task.depends_on.map(parent => ({ task, parent:tasks.value.find(item => item.stage === parent) })).filter(link => link.parent)))
 const date = value => new Intl.DateTimeFormat('zh-CN', { year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(new Date(value)).replace(',', ' /')
+const statusText = status => ({ ready:'待执行', running:'执行中', passed:'已交付', blocked:'等待依赖', skipped:'已跳过', not_applicable:'不适用', waiting:'等待方案' }[status] || status || '等待方案')
+const messageFrom = message => message.from || message.from_agent || 'team-lead'
+const messageTo = message => message.to || message.to_agent || 'team-lead'
 function select(agent, event) {
   if (selected.value?.key === agent.key) { selected.value = null; return }
   selected.value = agent
@@ -51,15 +65,15 @@ onUnmounted(() => clearInterval(timer))
     <div class="layout">
       <section ref="floor" class="floor" :class="{ 'has-detail': selected }">
         <span class="floor-title">A2A WORKSPACE · 上下文从 agent 到 agent 直接流转</span>
-        <svg class="wire"><line v-for="task in tasks.filter(task => task.depends_on.length)" :key="task.id" :x1="endpoint(tasks.find(parent => parent.stage === task.depends_on[0]) || task)[0]+'%'" :y1="endpoint(tasks.find(parent => parent.stage === task.depends_on[0]) || task)[1]+'%'" :x2="endpoint(task)[0]+'%'" :y2="endpoint(task)[1]+'%'" /></svg>
+        <svg class="wire"><line v-for="link in wireLinks" :key="link.task.id + link.parent.id" :x1="endpoint(link.parent)[0]+'%'" :y1="endpoint(link.parent)[1]+'%'" :x2="endpoint(link.task)[0]+'%'" :y2="endpoint(link.task)[1]+'%'" /></svg>
         <article v-for="(agent, index) in displayAgents" :key="agent.key" class="agent" :class="{ active:selected?.key === agent.key }" :style="{ ...position(agent,index), '--accent':color(agent) }" @click="select(agent,$event)">
           <div class="agent-head"><i class="avatar">{{ label(agent)[0] }}<em :class="currentTask(agent)?.status"></em></i><div><b>{{ label(agent) }}</b><span>{{ agent.key }}</span></div></div>
-          <p>{{ currentTask(agent)?.stage || agent.role }} · {{ currentTask(agent)?.status || '已注册' }}</p><div class="bar"><i :style="{ width: currentTask(agent)?.status === 'passed' ? '100%' : currentTask(agent)?.status === 'ready' ? '58%' : '0%' }"></i></div>
+          <p>{{ currentTask(agent)?.stage || agent.role }} · {{ statusText(currentTask(agent)?.status) }}</p><div class="bar"><i :style="{ width: currentTask(agent)?.status === 'passed' ? '100%' : currentTask(agent)?.status === 'running' ? '72%' : currentTask(agent)?.status === 'ready' ? '58%' : '0%' }"></i></div>
         </article>
-        <aside v-if="selected" class="detail" :style="detailStyle"><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ currentTask(selected)?.id || '未分配' }}</p><p>Broker Session：{{ workflow?.id || '未返回' }}</p><p>执行状态：{{ currentTask(selected)?.status || '已注册' }}</p><p>当前节点：{{ currentTask(selected)?.stage || selected.role }}</p></aside>
-        <div class="legend"><span>● 执行中</span><span>● 等待依赖</span><span>● 已交付</span><span>● 阻塞</span></div><p v-if="error" class="error">{{ error }}</p>
+        <aside v-if="selected" class="detail" :style="detailStyle"><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ currentTask(selected)?.id || '待 Team Lead 分派' }}</p><p>Broker Session：{{ workflow?.id || '未返回' }}</p><p>执行状态：{{ statusText(currentTask(selected)?.status) }}</p><p>当前节点：{{ currentTask(selected)?.stage || selected.role }}</p><p v-if="selected.key === 'team-lead'" class="hint">维护共享任务板、API Contract 与分支决策。</p><p v-if="selected.key === 'contract-audit'" class="hint">未通过前，前端与后端不会被分派。</p></aside>
+        <div class="legend"><span>● 执行中</span><span>● 等待依赖</span><span>● 已交付</span><span>● 已跳过</span></div><p v-if="error" class="error">{{ error }}</p>
       </section>
-      <aside class="side"><div class="side-head"><b>上下文流转日志</b><b>{{ logs.length }}</b></div><div v-if="logs.length" class="feed"><article v-for="message in logs" :key="message.id" class="event"><time>{{ date(message.created_at) }}</time><div><b :style="{ background: color(agents.find(agent => agent.key === message.from) || {}) }">{{ label(agents.find(agent => agent.key === message.from) || { name:message.from }) }}</b><span>→</span><b class="archive">{{ label(agents.find(agent => agent.key === message.to) || { name:message.to }) }}</b></div><p>{{ message.text }}</p></article></div><div v-else class="empty">Codex 确认任务后，<br>这里展示每次 A2A 交付与缺陷回派。</div></aside>
+      <aside class="side"><div class="side-head"><b>共享上下文 / 协作日志</b><b>{{ logs.length }}</b></div><div v-if="logs.length" class="feed"><article v-for="message in logs" :key="message.id" class="event"><time>{{ date(message.created_at) }}</time><div><b :style="{ background: color(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message) }) }">{{ label(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message), name:messageFrom(message) }) }}</b><span>→</span><b class="archive">{{ label(agents.find(agent => agent.key === messageTo(message)) || { key:messageTo(message), name:messageTo(message) }) }}</b><em v-if="message.kind">{{ message.kind }}</em></div><p>{{ message.text }}</p></article></div><div v-else class="empty">Team Lead 确认方案后，<br>这里展示交付、质疑、回复与缺陷回派。</div></aside>
     </div>
   </main>
 </template>

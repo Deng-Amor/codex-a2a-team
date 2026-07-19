@@ -48,3 +48,12 @@ def workflows(s:Session=Depends(db)):return [{"id":x.id,"title":x.title,"status"
 @app.get('/api/workflows/{workflow_id}')
 def get_workflow(workflow_id:str,s:Session=Depends(db)):
  wf=s.get(Workflow,workflow_id);return {"id":wf.id,"title":wf.title,"status":wf.status,"tasks":[{"id":t.id,"stage":t.stage_key,"agent":t.agent_key,"status":t.status,"depends_on":t.depends_on.split(',') if t.depends_on else []} for t in s.scalars(select(Task).where(Task.workflow_id==workflow_id))]}
+@app.post('/api/workflows/{workflow_id}/tasks/{task_id}/complete')
+def complete(workflow_id:str,task_id:str,s:Session=Depends(db)):
+ task=s.get(Task,task_id)
+ if not task or task.workflow_id!=workflow_id: return {"error":"task not found"}
+ task.status='passed';tasks=list(s.scalars(select(Task).where(Task.workflow_id==workflow_id)))
+ for item in tasks:
+  if item.status=='blocked' and all(next(x for x in tasks if x.stage_key==dep).status=='passed' for dep in item.depends_on.split(',') if dep):item.status='ready'
+ if all(item.status=='passed' for item in tasks):s.get(Workflow,workflow_id).status='completed'
+ s.commit();return {"id":task.id,"status":task.status}

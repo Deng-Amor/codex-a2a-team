@@ -43,6 +43,8 @@ def create_workflow(payload:dict,s:Session=Depends(db)):
  for stage in s.scalars(select(Stage)):
   s.add(Task(id=f'{wid}_{stage.key}',workflow_id=wid,stage_key=stage.key,agent_key=stage.agent_key,status='ready' if not stage.depends_on else 'blocked',depends_on=stage.depends_on))
  s.commit();return {"id":wid,"status":"running"}
+@app.get('/api/workflows')
+def workflows(s:Session=Depends(db)):return [{"id":x.id,"title":x.title,"status":x.status} for x in s.scalars(select(Workflow))]
 @app.get('/api/workflows/{workflow_id}')
 def get_workflow(workflow_id:str,s:Session=Depends(db)):
  wf=s.get(Workflow,workflow_id);return {"id":wf.id,"title":wf.title,"status":wf.status,"tasks":[{"id":t.id,"stage":t.stage_key,"agent":t.agent_key,"status":t.status,"depends_on":t.depends_on.split(',') if t.depends_on else []} for t in s.scalars(select(Task).where(Task.workflow_id==workflow_id))]}

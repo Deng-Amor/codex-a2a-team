@@ -5,8 +5,8 @@ const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = 
 const meta = { 'team-lead':['Team Lead','#172554',6,9], 'contract-audit':['方案审计','#dc981f',36,10], 'task-decomposer':['任务拆分','#8b5cf6',6,38], 'architecture-agent':['架构设计','#3b82f6',36,31], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,66], 'backend-agent':['后端开发','#0d9ab7',66,66], 'audit-agent':['代码审计','#dc981f',66,40], 'test-agent':['测试验证','#e15b93',6,66], 'deployment-agent':['部署发布','#374151',36,40] }
 const virtualNodes = [{ key:'team-lead', name:'Team Lead', role:'lead' }, { key:'contract-audit', name:'方案审计', role:'contract audit' }]
 const currentTask = agent => {
-  if (agent.key === 'team-lead') return tasks.value.find(task => /(^|[-_])lead|plan|contract/.test(task.stage) || /team[-_]?lead/.test(task.agent))
-  if (agent.key === 'contract-audit') return tasks.value.find(task => /contract.*audit|audit.*contract|pre[-_]?audit/.test(task.stage))
+  if (agent.key === 'team-lead') return tasks.value.find(task => task.agent === 'team-lead' || task.stage === 'team_lead')
+  if (agent.key === 'contract-audit') return tasks.value.find(task => task.stage === 'contract_audit')
   return tasks.value.find(task => task.agent === agent.key)
 }
 const complete = computed(() => tasks.value.filter(task => task.status === 'passed').length)
@@ -21,16 +21,17 @@ const selectedDetail = computed(() => {
   const task = selectedTask.value || {}
   return parseDetail(task.detail || task.output || task.artifact || task.result)
 })
-const taskDescription = computed(() => selectedDetail.value.description || selectedDetail.value.summary || selectedTask.value?.description || selectedTask.value?.instruction || (selected.value?.key === 'team-lead' ? '澄清需求、制定技术方案与 REST API Contract，并维护共享任务板。' : '等待 Team Lead 分派具体任务。'))
+const taskDescription = computed(() => selectedDetail.value.instructions || selectedDetail.value.description || selectedDetail.value.summary || selectedTask.value?.description || selectedTask.value?.instruction || (selected.value?.key === 'team-lead' ? '澄清需求、制定技术方案与 REST API Contract，并维护共享任务板。' : '等待 Team Lead 分派具体任务。'))
 const artifacts = computed(() => {
   const value = selectedDetail.value.artifacts || selectedDetail.value.deliverables || selectedTask.value?.artifacts || []
   return Array.isArray(value) ? value : Object.entries(value).map(([name, content]) => ({ name, content }))
 })
 const contractArtifact = computed(() => artifacts.value.find(artifact => artifact?.type === 'api_contract'))
 const steps = computed(() => {
-  const value = selectedDetail.value.steps || selectedDetail.value.execution_steps || selectedDetail.value.logs || selectedTask.value?.steps || []
+  const value = selectedDetail.value.execution_log || selectedDetail.value.steps || selectedDetail.value.execution_steps || selectedDetail.value.logs || selectedTask.value?.steps || []
   return Array.isArray(value) ? value : [value]
 })
+const deliveryEvidence = computed(() => steps.value.filter(step => typeof step === 'object' && step.event === '交付证据'))
 const apiContract = computed(() => {
   const value = selectedDetail.value.api_contract || selectedDetail.value.apiContract || selectedTask.value?.api_contract || contractArtifact.value?.content || workflow.value?.api_contract
   if (value) return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
@@ -65,13 +66,20 @@ function select(agent, event) {
 }
 async function load() {
   try {
-    agents.value = await fetch('/api/agents').then(response => response.json())
-    workflows.value = await fetch('/api/workflows').then(response => response.json())
+    const fetchJson = async url => {
+      const response = await fetch(url)
+      const body = await response.text()
+      if (!response.ok) throw Error(body || `${response.status} ${response.statusText}`)
+      return body ? JSON.parse(body) : null
+    }
+    agents.value = await fetchJson('/api/agents')
+    workflows.value = await fetchJson('/api/workflows')
+    workflows.value.sort((left, right) => new Date(left.created_at) - new Date(right.created_at))
     if (followLatest.value) workflowId.value = workflows.value.at(-1)?.id || ''
     else workflowId.value ||= workflows.value.at(-1)?.id || ''
     workflow.value = workflows.value.find(item => item.id === workflowId.value) || workflows.value.at(-1) || null
     workflowId.value = workflow.value?.id || ''
-    const detail = workflow.value ? await fetch('/api/workflows/'+workflow.value.id).then(response => response.json()) : { tasks:[], messages:[] }
+    const detail = workflow.value ? await fetchJson('/api/workflows/'+workflow.value.id) : { tasks:[], messages:[] }
     tasks.value = detail.tasks; messages.value = detail.messages
     if (selected.value && !displayAgents.value.some(agent => agent.key === selected.value.key)) selected.value = null
   } catch (exception) { error.value = exception.message }
@@ -97,7 +105,7 @@ onUnmounted(() => clearInterval(timer))
           <div class="agent-head"><i class="avatar">{{ label(agent)[0] }}<em :class="currentTask(agent)?.status"></em></i><div><b>{{ label(agent) }}</b><span>{{ agent.key }}</span></div></div>
           <p>{{ currentTask(agent)?.stage || agent.role }} · {{ statusText(currentTask(agent)?.status) }}</p><div class="bar"><i :style="{ width: currentTask(agent)?.status === 'passed' ? '100%' : currentTask(agent)?.status === 'running' ? '72%' : currentTask(agent)?.status === 'ready' ? '58%' : '0%' }"></i></div>
         </article>
-        <aside v-if="selected" class="detail" :style="detailStyle" @click.stop><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ selectedTask?.id || '待 Team Lead 分派' }}</p><p>执行状态：{{ statusText(selectedTask?.status) }}</p><section><h4>正在做什么</h4><p>{{ taskDescription }}</p></section><section v-if="apiContract"><h4>REST API Contract</h4><pre>{{ apiContract }}</pre></section><section v-if="steps.length"><h4>执行步骤 / 日志</h4><ol><li v-for="(step, index) in steps" :key="index">{{ typeof step === 'string' ? step : step.text || step.name || JSON.stringify(step) }}</li></ol></section><section v-if="artifacts.length"><h4>{{ selectedTask?.status === 'passed' ? '实际交付物' : '计划交付物' }}</h4><ul><li v-for="(artifact, index) in artifacts" :key="index">{{ typeof artifact === 'string' ? artifact : artifact.name || artifact.path || JSON.stringify(artifact) }}</li></ul></section><section v-if="nodeMessages.length"><h4>协作消息</h4><p v-for="message in nodeMessages" :key="message.id" class="message">{{ label(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message), name:messageFrom(message) }) }}：{{ message.text }}</p></section><p v-if="selected.key === 'contract-audit'" class="hint">未通过前，前端与后端不会被分派。</p></aside>
+        <aside v-if="selected" class="detail" :style="detailStyle" @click.stop><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ selectedTask?.id || '待 Team Lead 分派' }}</p><p>执行状态：{{ statusText(selectedTask?.status) }}</p><section><h4>正在做什么</h4><p>{{ taskDescription }}</p></section><section v-if="apiContract"><h4>REST API Contract</h4><pre>{{ apiContract }}</pre></section><section v-if="steps.length"><h4>执行步骤 / 日志</h4><ol><li v-for="(step, index) in steps" :key="index">{{ typeof step === 'string' ? step : step.detail || step.text || step.name || JSON.stringify(step) }}</li></ol></section><section v-if="artifacts.length"><h4>{{ deliveryEvidence.length ? '计划交付物 / 对应证据' : '计划交付物（尚未记录交付证据）' }}</h4><ul><li v-for="(artifact, index) in artifacts" :key="index">{{ typeof artifact === 'string' ? artifact : artifact.name || artifact.path || JSON.stringify(artifact) }}</li></ul></section><section v-if="deliveryEvidence.length"><h4>实际交付证据</h4><p v-for="(item, index) in deliveryEvidence" :key="index" class="message">{{ item.detail }}</p></section><section v-if="nodeMessages.length"><h4>协作消息</h4><p v-for="message in nodeMessages" :key="message.id" class="message">{{ label(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message), name:messageFrom(message) }) }}：{{ message.text }}</p></section><p v-if="selected.key === 'contract-audit'" class="hint">未通过前，前端与后端不会被分派。</p></aside>
         <div class="legend"><span>● 执行中</span><span>● 等待依赖</span><span>● 已交付</span><span>● 已跳过</span></div><p v-if="error" class="error">{{ error }}</p>
       </section>
       <aside class="side"><div class="side-head"><b>共享上下文 / 协作日志</b><b>{{ logs.length }}</b></div><div v-if="logs.length" class="feed"><article v-for="message in logs" :key="message.id" class="event"><time>{{ date(message.created_at) }}</time><div><b :style="{ background: color(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message) }) }">{{ label(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message), name:messageFrom(message) }) }}</b><span>→</span><b class="archive">{{ label(agents.find(agent => agent.key === messageTo(message)) || { key:messageTo(message), name:messageTo(message) }) }}</b><em v-if="message.kind">{{ message.kind }}</em></div><p>{{ message.text }}</p></article></div><div v-else class="empty">Team Lead 确认方案后，<br>这里展示交付、质疑、回复与缺陷回派。</div></aside>

@@ -221,6 +221,9 @@ SCHEMA_MIGRATIONS = {
     "20260720_workflow_created_at": (
         "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
     ),
+    "20260720_workflow_created_at_backfill": (
+        "UPDATE workflows SET created_at = COALESCE((SELECT MIN(created_at) FROM workflow_events WHERE workflow_events.workflow_id = workflows.id), created_at)",
+    ),
 }
 
 
@@ -442,7 +445,8 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
 @app.get("/api/workflows")
 def workflows(session: Session = Depends(db)):
     return [{"id": item.id, "title": item.title, "status": item.status, "engine": item.engine,
-             "graph_version": item.graph_version, "thread_id": item.thread_id} for item in session.scalars(select(Workflow).order_by(Workflow.created_at))]
+             "graph_version": item.graph_version, "thread_id": item.thread_id, "created_at": item.created_at.isoformat()}
+            for item in session.scalars(select(Workflow).where(Workflow.status != "invalidated").order_by(Workflow.created_at))]
 
 
 @app.get("/api/workflows/{workflow_id}")
@@ -726,6 +730,9 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
         return previous
     if task.status not in {"ready", "running"}:
         raise HTTPException(409, "task is not ready")
+    evidence = str(payload.get("evidence", "")).strip()
+    if not evidence:
+        raise HTTPException(422, "evidence is required before a task can be delivered")
     if task.iterations >= MAX_TASK_ITERATIONS:
         raise HTTPException(409, "task iteration limit reached")
     task.status = "passed"
@@ -733,7 +740,7 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", ""))
     log = decode(task.execution_log)
-    log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "节点已交付", "detail": task.handoff_summary})
+    log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence})
     task.execution_log = json.dumps(log, ensure_ascii=False)
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow_id)).all()
     by_stage = {item.stage_key: item for item in tasks}
@@ -751,5 +758,27 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
                             idempotency_key=idempotency_key or f"complete_{task.id}_{task.attempt_id}"))
     append_event(session, session.get(Workflow, workflow_id), "task.passed", task_id=task.id,
                  payload={"response": response, "attempt_id": task.attempt_id}, idempotency_key=idempotency_key)
+    session.commit()
+    return response
+
+
+@app.post("/api/workflows/{workflow_id}/tasks/{task_id}/evidence")
+def record_evidence(workflow_id: str, task_id: str, payload: dict, session: Session = Depends(db)):
+    task = session.get(Task, task_id)
+    if not task or task.workflow_id != workflow_id:
+        raise HTTPException(404, "task not found")
+    evidence = str(payload.get("evidence", "")).strip()
+    if not evidence:
+        raise HTTPException(422, "evidence is required")
+    idempotency_key = str(payload.get("idempotency_key", "")).strip()
+    previous = event_response(session, workflow_id, idempotency_key)
+    if previous is not None:
+        return previous
+    log = decode(task.execution_log)
+    log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence})
+    task.execution_log = json.dumps(log, ensure_ascii=False)
+    response = {"id": task.id, "status": task.status}
+    append_event(session, session.get(Workflow, workflow_id), "task.evidence.recorded", task_id=task.id,
+                 payload={"response": response, "evidence": evidence}, idempotency_key=idempotency_key)
     session.commit()
     return response

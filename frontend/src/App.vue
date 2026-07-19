@@ -81,6 +81,7 @@ async function load() {
     workflowId.value = workflow.value?.id || ''
     const detail = workflow.value ? await fetchJson('/api/workflows/'+workflow.value.id) : { tasks:[], messages:[] }
     tasks.value = detail.tasks; messages.value = detail.messages
+    error.value = ''
     if (selected.value && !displayAgents.value.some(agent => agent.key === selected.value.key)) selected.value = null
   } catch (exception) { error.value = exception.message }
 }

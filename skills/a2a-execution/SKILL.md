@@ -7,6 +7,10 @@ description: "Coordinate software work through the local Codex A2A Team broker. 
 
 Keep the user interaction in this Codex task. Do not send the user to a dashboard to enter the task.
 
+## Execution-mode gate
+
+Before any non-read-only change, ask the user to select `A2A` or `主控直改`. A request described as small, urgent, or a bug fix still needs this selection. A prior selection applies only to its named workflow; do not reuse it for a later change. If A2A is selected, create the workflow and open the Dashboard before modifying code. If direct mode is selected, state `execution_mode=direct` with the final verification evidence.
+
 1. Convert the request into a concise confirmation containing scope, exclusions, acceptance criteria, repository path, and whether low-risk auto-merge is allowed.
 2. Wait for explicit confirmation such as `确认执行`. Do not start any A2A worker before it.
 3. On confirmation, require `A2A_TEAM_HOME` to point to the installed A2A Team directory, then run `$env:A2A_TEAM_HOME\start-workflow.ps1`. Pass the confirmed scope as `Request`, the project root as `Repository`, and set `-AutoMerge` only if the user explicitly authorized low-risk auto-merge.

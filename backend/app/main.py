@@ -287,6 +287,36 @@ def task_data(item: Task, details=False):
     return data
 
 
+def queue_repair_regression(session: Session, workflow: Workflow, owner: Task, content: str, source: Task | None = None):
+    """Reopen one owner and only its downstream gates for a defect regression."""
+    owner.status = "repairing"
+    owner.instructions = f"正在修复：{content}"
+    owner_log = decode(owner.execution_log)
+    owner_log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "缺陷已接收", "detail": owner.instructions})
+    owner.execution_log = json.dumps(owner_log, ensure_ascii=False)
+
+    tasks = session.scalars(select(Task).where(Task.workflow_id == workflow.id)).all()
+    reopen = {owner.stage_key}
+    changed = True
+    while changed:
+        changed = False
+        for item in tasks:
+            dependencies = set(filter(None, item.depends_on.split(",")))
+            if item.stage_key not in reopen and dependencies & reopen:
+                reopen.add(item.stage_key)
+                changed = True
+    for item in tasks:
+        if item.stage_key == owner.stage_key or item.stage_key not in reopen:
+            continue
+        item.status = "blocked"
+        log = decode(item.execution_log)
+        log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "等待回归", "detail": f"等待 {owner.stage_key} 修复缺陷后重新执行。"})
+        item.execution_log = json.dumps(log, ensure_ascii=False)
+    if source:
+        session.add(Message(workflow_id=workflow.id, task_id=owner.id, from_agent=source.agent_key,
+                            to_agent=owner.agent_key, kind="handoff", text=f"DEFECT 已接收，{owner.instructions}"))
+
+
 def task_detail(stage: str, workflow: Workflow, route: str):
     contract = [
         {"operation": "GET /api/v1/resources", "purpose": "分页查询资源", "response": '{"items": [{"id": "string", "name": "string", "status": "active"}], "total": 0}'},
@@ -621,7 +651,8 @@ def add_defect(workflow_id: str, payload: dict, session: Session = Depends(db)):
     if not owner or not content:
         raise HTTPException(422, "owner_agent and content are required")
     task_id = str(payload.get("task_id", "")).strip()
-    if task_id and (not (task := session.get(Task, task_id)) or task.workflow_id != workflow_id):
+    source_task = None
+    if task_id and (not (source_task := session.get(Task, task_id)) or source_task.workflow_id != workflow_id):
         raise HTTPException(404, "task not found")
     idempotency_key = str(payload.get("idempotency_key", "")).strip()
     previous = event_response(session, workflow_id, idempotency_key)
@@ -631,11 +662,17 @@ def add_defect(workflow_id: str, payload: dict, session: Session = Depends(db)):
     existing = session.scalar(select(Defect).where(Defect.workflow_id == workflow_id, Defect.content_hash == content_digest))
     if existing:
         return {"id": existing.id, "status": existing.status, "duplicate": True}
+    owner_task = session.scalar(select(Task).where(Task.workflow_id == workflow_id, Task.agent_key == owner))
+    if not owner_task:
+        raise HTTPException(422, "owner_agent does not have a task in this workflow")
     defect = Defect(id="defect_" + uuid4().hex, workflow_id=workflow_id, task_id=task_id, owner_agent=owner,
                     content=content, content_hash=content_digest)
     session.add(defect)
-    response = {"id": defect.id, "status": defect.status}
-    append_event(session, workflow, "defect.opened", task_id=task_id, payload={"response": response, "owner_agent": owner}, idempotency_key=idempotency_key)
+    session.flush()
+    queue_repair_regression(session, workflow, owner_task, content, source_task)
+    response = {"id": defect.id, "status": defect.status, "owner_task_id": owner_task.id, "owner_status": owner_task.status}
+    append_event(session, workflow, "defect.opened", task_id=owner_task.id,
+                 payload={"response": response, "owner_agent": owner, "content": content}, idempotency_key=idempotency_key)
     session.commit()
     return response
 
@@ -657,6 +694,12 @@ def transition_defect(workflow_id: str, defect_id: str, payload: dict, session: 
         raise HTTPException(409, f"invalid defect transition: {defect.status} -> {target}")
     defect.status = target
     response = {"id": defect.id, "status": defect.status}
+    owner_task = session.scalar(select(Task).where(Task.workflow_id == workflow_id, Task.agent_key == defect.owner_agent))
+    if owner_task and target in {"fixed", "verified"}:
+        log = decode(owner_task.execution_log)
+        detail = "缺陷修复已交付，等待审计复验。" if target == "fixed" else "缺陷已通过回归验证。"
+        log.append({"at": datetime.now(timezone.utc).isoformat(), "event": f"缺陷{target}", "detail": detail})
+        owner_task.execution_log = json.dumps(log, ensure_ascii=False)
     append_event(session, workflow, f"defect.{target}", task_id=defect.task_id,
                  payload={"response": response, "owner_agent": defect.owner_agent}, idempotency_key=idempotency_key)
     session.commit()
@@ -709,9 +752,10 @@ def start_task(workflow_id: str, task_id: str, payload: dict | None = None, sess
     previous = event_response(session, workflow_id, idempotency_key)
     if previous is not None:
         return previous
-    if task.status not in {"ready", "running"}:
+    if task.status not in {"ready", "running", "repairing"}:
         raise HTTPException(409, "task is not ready")
-    task.status = "running"
+    if task.status != "repairing":
+        task.status = "running"
     task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", "codex"))
     response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id}
@@ -735,19 +779,23 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     previous = event_response(session, workflow_id, idempotency_key)
     if previous is not None:
         return previous
-    if task.status not in {"ready", "running"}:
+    if task.status not in {"ready", "running", "repairing"}:
         raise HTTPException(409, "task is not ready")
     evidence = str(payload.get("evidence", "")).strip()
     if not evidence:
         raise HTTPException(422, "evidence is required before a task can be delivered")
     if task.iterations >= MAX_TASK_ITERATIONS:
         raise HTTPException(409, "task iteration limit reached")
+    was_repairing = task.status == "repairing"
     task.status = "passed"
     task.iterations += 1
     task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", ""))
     log = decode(task.execution_log)
     log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence})
+    if was_repairing:
+        task.instructions = "缺陷修复已交付，等待审计复验。"
+        log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "回归已排队", "detail": "修复已交付；下游审计与测试将按依赖重新执行。"})
     task.execution_log = json.dumps(log, ensure_ascii=False)
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow_id)).all()
     by_stage = {item.stage_key: item for item in tasks}

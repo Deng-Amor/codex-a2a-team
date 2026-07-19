@@ -1,11 +1,11 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), tasks = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({})
+const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), tasks = ref([]), messages = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({})
 const meta = { 'task-decomposer':['任务拆分','#8b5cf6',6,33], 'architecture-agent':['架构设计','#3b82f6',36,10], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,65], 'backend-agent':['后端开发','#0d9ab7',66,65], 'audit-agent':['代码审计','#dc981f',66,37], 'test-agent':['测试验证','#e15b93',6,65], 'deployment-agent':['部署发布','#374151',36,37] }
 const currentTask = agent => tasks.value.find(task => task.agent === agent.key)
 const complete = computed(() => tasks.value.filter(task => task.status === 'passed').length)
-const logs = computed(() => tasks.value.filter(task => task.status !== 'blocked').slice().reverse())
+const logs = computed(() => messages.value)
 const displayAgents = computed(() => agents.value.filter(agent => tasks.value.some(task => task.agent === agent.key)))
 const position = (agent, index) => { const saved = meta[agent.key]; return saved ? { left:saved[2]+'%', top:saved[3]+'%' } : { left:(8+(index%3)*29)+'%', top:(10+Math.floor(index/3)*25)+'%' } }
 const color = agent => meta[agent.key]?.[1] || '#64748b'
@@ -29,7 +29,8 @@ async function load() {
     workflowId.value ||= workflows.value.at(-1)?.id || ''
     workflow.value = workflows.value.find(item => item.id === workflowId.value) || workflows.value.at(-1) || null
     workflowId.value = workflow.value?.id || ''
-    tasks.value = workflow.value ? (await fetch('/api/workflows/'+workflow.value.id).then(response => response.json())).tasks : []
+    const detail = workflow.value ? await fetch('/api/workflows/'+workflow.value.id).then(response => response.json()) : { tasks:[], messages:[] }
+    tasks.value = detail.tasks; messages.value = detail.messages
     if (selected.value && !displayAgents.value.some(agent => agent.key === selected.value.key)) selected.value = null
   } catch (exception) { error.value = exception.message }
 }
@@ -57,7 +58,7 @@ onUnmounted(() => clearInterval(timer))
         <aside v-if="selected" class="detail" :style="detailStyle"><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ currentTask(selected)?.id || '未分配' }}</p><p>Broker Session：{{ workflow?.id || '未返回' }}</p><p>执行状态：{{ currentTask(selected)?.status || '已注册' }}</p><p>当前节点：{{ currentTask(selected)?.stage || selected.role }}</p></aside>
         <div class="legend"><span>● 执行中</span><span>● 等待依赖</span><span>● 已交付</span><span>● 阻塞</span></div><p v-if="error" class="error">{{ error }}</p>
       </section>
-      <aside class="side"><div class="side-head"><b>上下文流转日志</b><b>{{ logs.length }}</b></div><div v-if="logs.length" class="feed"><article v-for="task in logs" :key="task.id" class="event"><time>{{ date(task.updated_at) }}</time><div><b :style="{ background: color(agents.find(agent => agent.key === task.agent) || {}) }">{{ label(agents.find(agent => agent.key === task.agent) || { name:task.agent }) }}</b><span>→</span><b class="archive">{{ task.status === 'passed' ? 'archive' : task.agent }}</b></div><p>{{ task.stage }}：{{ task.status === 'passed' ? '已交付，等待下一节点接收。' : '正在执行或等待依赖解除。' }}</p></article></div><div v-else class="empty">Codex 确认任务后，<br>这里展示每次 A2A 交付与缺陷回派。</div></aside>
+      <aside class="side"><div class="side-head"><b>上下文流转日志</b><b>{{ logs.length }}</b></div><div v-if="logs.length" class="feed"><article v-for="message in logs" :key="message.id" class="event"><time>{{ date(message.created_at) }}</time><div><b :style="{ background: color(agents.find(agent => agent.key === message.from) || {}) }">{{ label(agents.find(agent => agent.key === message.from) || { name:message.from }) }}</b><span>→</span><b class="archive">{{ label(agents.find(agent => agent.key === message.to) || { name:message.to }) }}</b></div><p>{{ message.text }}</p></article></div><div v-else class="empty">Codex 确认任务后，<br>这里展示每次 A2A 交付与缺陷回派。</div></aside>
     </div>
   </main>
 </template>

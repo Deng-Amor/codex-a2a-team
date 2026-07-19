@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import DateTime, String, create_engine, select, text
+from sqlalchemy import DateTime, String, create_engine, select, text as sql
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
@@ -52,7 +52,18 @@ class Task(Base):
     agent_key: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(30))
     depends_on: Mapped[str] = mapped_column(String, default="")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), onupdate=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class Message(Base):
+    __tablename__ = "a2a_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(40))
+    task_id: Mapped[str] = mapped_column(String(80))
+    from_agent: Mapped[str] = mapped_column(String(80))
+    to_agent: Mapped[str] = mapped_column(String(80))
+    text: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
 
 
 DEFAULT_AGENTS = [
@@ -90,7 +101,7 @@ def db():
 def boot():
     Base.metadata.create_all(engine)
     with Local() as session:
-        session.execute(text("ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP"))
+        session.execute(sql("ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP"))
         existing_agents = {item.key for item in session.scalars(select(Agent))}
         existing_stages = {item.key for item in session.scalars(select(Stage))}
         session.add_all(Agent(key=key, name=name, role=role) for key, name, role in DEFAULT_AGENTS if key not in existing_agents)
@@ -130,6 +141,7 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
     session.add(Workflow(id=workflow_id, title=payload["title"], request=payload["request"]))
     for stage in session.scalars(select(Stage)):
         session.add(Task(id=f"{workflow_id}_{stage.key}", workflow_id=workflow_id, stage_key=stage.key, agent_key=stage.agent_key, status="ready" if not stage.depends_on else "blocked", depends_on=stage.depends_on))
+    session.add(Message(workflow_id=workflow_id, task_id=f"{workflow_id}_decompose", from_agent="codex", to_agent="task-decomposer", text="需求已确认，开始任务拆分。"))
     session.commit()
     return {"id": workflow_id, "status": "running"}
 
@@ -145,7 +157,8 @@ def get_workflow(workflow_id: str, session: Session = Depends(db)):
     if not workflow:
         raise HTTPException(404, "workflow not found")
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow_id)).all()
-    return {"id": workflow.id, "title": workflow.title, "status": workflow.status, "tasks": [{"id": item.id, "stage": item.stage_key, "agent": item.agent_key, "status": item.status, "depends_on": item.depends_on.split(",") if item.depends_on else [], "updated_at": item.updated_at.isoformat()} for item in tasks]}
+    messages = session.scalars(select(Message).where(Message.workflow_id == workflow_id).order_by(Message.id.desc())).all()
+    return {"id": workflow.id, "title": workflow.title, "status": workflow.status, "tasks": [{"id": item.id, "stage": item.stage_key, "agent": item.agent_key, "status": item.status, "depends_on": item.depends_on.split(",") if item.depends_on else [], "updated_at": item.updated_at.isoformat()} for item in tasks], "messages": [{"id": item.id, "from": item.from_agent, "to": item.to_agent, "text": item.text, "created_at": item.created_at.isoformat()} for item in messages]}
 
 
 @app.post("/api/workflows/{workflow_id}/tasks/{task_id}/complete")
@@ -162,6 +175,7 @@ def complete(workflow_id: str, task_id: str, session: Session = Depends(db)):
         dependencies = item.depends_on.split(",") if item.depends_on else []
         if item.status == "blocked" and all(by_stage[dependency].status == "passed" for dependency in dependencies):
             item.status = "ready"
+            session.add(Message(workflow_id=workflow_id, task_id=task.id, from_agent=task.agent_key, to_agent=item.agent_key, text=f"{task.stage_key} 已交付，{item.stage_key} 节点可以开始。"))
     if all(item.status == "passed" for item in tasks):
         session.get(Workflow, workflow_id).status = "completed"
     session.commit()

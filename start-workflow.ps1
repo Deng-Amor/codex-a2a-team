@@ -1,22 +1,18 @@
 param(
   [Parameter(Mandatory = $true)][string]$Title,
   [Parameter(Mandatory = $true)][string]$Request,
-  [Parameter(Mandatory = $true)][string]$Repository,
-  [switch]$AutoMerge
+  [Parameter(Mandatory = $true)][string]$Repository
 )
 
-$repoPath = (Resolve-Path -LiteralPath $Repository).Path
-$listening = Get-NetTCPConnection -LocalPort 4318 -State Listen -ErrorAction SilentlyContinue
-if (-not $listening) {
-  Start-Process -FilePath powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\run-team.ps1", '-Repository', $repoPath) -WindowStyle Hidden
-  foreach ($attempt in 1..40) {
-    if (Get-NetTCPConnection -LocalPort 4318 -State Listen -ErrorAction SilentlyContinue) { break }
-    Start-Sleep -Milliseconds 250
-  }
+if (-not (Test-Path -LiteralPath $Repository)) { throw "Repository not found: $Repository" }
+if (-not (Get-NetTCPConnection -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue)) {
+  throw 'FastAPI is not running on port 8010. Start it with the README command first.'
 }
-if (-not (Get-NetTCPConnection -LocalPort 4318 -State Listen -ErrorAction SilentlyContinue)) { throw 'A2A Broker did not start on port 4318.' }
-$payload = @{ title = $Title; request = $Request; repository = $repoPath; autoMerge = [bool]$AutoMerge } | ConvertTo-Json
-$workflow = Invoke-RestMethod 'http://127.0.0.1:4318/api/workflows' -Method Post -ContentType 'application/json' -Body $payload
-Invoke-RestMethod "http://127.0.0.1:4318/api/workflows/$($workflow.id)/confirm" -Method Post | Out-Null
-Start-Process 'http://127.0.0.1:4318'
+if (-not (Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue)) {
+  throw 'Dashboard is not running on port 5173. Start Vite with the README command first.'
+}
+
+$payload = @{ title = $Title; request = $Request; engine = 'langgraph_v1' } | ConvertTo-Json
+$workflow = Invoke-RestMethod 'http://127.0.0.1:8010/api/workflows' -Method Post -ContentType 'application/json' -Body $payload
+Start-Process 'http://127.0.0.1:5173'
 $workflow.id

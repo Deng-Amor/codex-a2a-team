@@ -13,8 +13,9 @@ Before any non-read-only change, ask the user to select `A2A` or `主控直改`.
 
 1. Convert the request into a concise confirmation containing scope, exclusions, acceptance criteria, repository path, and whether low-risk auto-merge is allowed.
 2. Wait for explicit confirmation such as `确认执行`. Do not start any A2A worker before it.
-3. On confirmation, require `A2A_TEAM_HOME` to point to the installed A2A Team directory, then run `$env:A2A_TEAM_HOME\start-workflow.ps1`. Pass the confirmed scope as `Request`, the project root as `Repository`, and set `-AutoMerge` only if the user explicitly authorized low-risk auto-merge.
-4. Tell the user the workflow has started and that the local dashboard has opened. Continue to use this chat for material decisions, blocked deployment/PR review, and final delivery.
-5. Do not claim a stage passed unless the dashboard/result evidence reports it. If the deployment agent returns `BLOCKED`, give the user the PR URL and the reason.
+3. On confirmation, require `A2A_TEAM_HOME` to point to the installed A2A Team directory. Confirm FastAPI is listening on `8010` and Dashboard/Vite is listening on `5173`, then run `$env:A2A_TEAM_HOME\start-workflow.ps1`. Pass the confirmed scope as `Request` and the project root as `Repository`.
+4. The script creates the Workflow and opens Dashboard. Before starting any node, write the Team Lead input to `POST /api/workflows/{workflow_id}/messages`; only then start the Team Lead task through the API.
+5. Tell the user the workflow has started and that the local dashboard has opened. Continue to use this chat for material decisions, blocked deployment/PR review, and final delivery.
+6. Do not claim a stage passed unless the dashboard/result evidence reports it. If the deployment agent returns `BLOCKED`, give the user the PR URL and the reason.
 
 The dashboard is observability and control for the confirmed run; the Codex chat remains the task-entry and approval surface.

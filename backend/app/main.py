@@ -58,6 +58,7 @@ class Workflow(Base):
     thread_id: Mapped[str] = mapped_column(String(80), default="")
     next_event_sequence: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
 
 
 class Task(Base):
@@ -224,6 +225,10 @@ SCHEMA_MIGRATIONS = {
     "20260720_workflow_created_at_backfill": (
         "UPDATE workflows SET created_at = COALESCE((SELECT MIN(created_at) FROM workflow_events WHERE workflow_events.workflow_id = workflows.id), created_at)",
     ),
+    "20260720_workflow_last_activity": (
+        "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "UPDATE workflows SET last_activity_at = COALESCE((SELECT MAX(created_at) FROM workflow_events WHERE workflow_events.workflow_id = workflows.id), created_at)",
+    ),
 }
 
 
@@ -260,6 +265,7 @@ def append_event(session: Session, workflow: Workflow, event_type: str, *, task_
     """Write the audit event and its outbox record in the business transaction."""
     locked = session.execute(select(Workflow).where(Workflow.id == workflow.id).with_for_update()).scalar_one()
     locked.next_event_sequence += 1
+    locked.last_activity_at = datetime.now(timezone.utc)
     event = WorkflowEvent(workflow_id=workflow.id, sequence=locked.next_event_sequence, event_type=event_type,
                           task_id=task_id, payload=json.dumps(payload or {}, ensure_ascii=False),
                           idempotency_key=idempotency_key or f"event_{uuid4().hex}")
@@ -445,8 +451,9 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
 @app.get("/api/workflows")
 def workflows(session: Session = Depends(db)):
     return [{"id": item.id, "title": item.title, "status": item.status, "engine": item.engine,
-             "graph_version": item.graph_version, "thread_id": item.thread_id, "created_at": item.created_at.isoformat()}
-            for item in session.scalars(select(Workflow).where(Workflow.status != "invalidated").order_by(Workflow.created_at))]
+             "graph_version": item.graph_version, "thread_id": item.thread_id, "created_at": item.created_at.isoformat(),
+             "last_activity_at": item.last_activity_at.isoformat()}
+            for item in session.scalars(select(Workflow).where(Workflow.status != "invalidated").order_by(Workflow.last_activity_at.desc()))]
 
 
 @app.get("/api/workflows/{workflow_id}")

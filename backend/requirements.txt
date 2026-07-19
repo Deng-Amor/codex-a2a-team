@@ -1,4 +1,6 @@
 fastapi
 uvicorn[standard]
 sqlalchemy
-psycopg[binary]
+psycopg[binary,pool]
+langgraph
+langgraph-checkpoint-postgres

@@ -136,7 +136,7 @@ pg_dump -Fc -h 127.0.0.1 -p 5432 -U postgres -d agent_to_agent -f data\backups\a
 1. 阶段三：长任务 `interrupt()`、lease/fencing token、Worker 回调签名、Codex CLI + Git Worktree、PR 与部署。
 2. Redis 仅在确实需要队列、分布式锁、限流或高并发时再接入。
 
-旧的 Node `server.mjs` / `worker.mjs` 是历史 `node_legacy` 原型，不要用 `run-team.ps1` 启动当前 FastAPI Dashboard。当前入口是本 README 的 8010 + 5173 命令。
+历史 Node 4318 原型及 Vue 模板演示文件已移除，避免办公电脑误启动错误入口。当前唯一入口是本 README 的 FastAPI 8010 + Vite 5173 命令。
 
 ## 常见问题
 

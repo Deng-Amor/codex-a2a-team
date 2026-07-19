@@ -57,6 +57,7 @@ class Workflow(Base):
     state_schema_version: Mapped[int] = mapped_column(default=1)
     thread_id: Mapped[str] = mapped_column(String(80), default="")
     next_event_sequence: Mapped[int] = mapped_column(default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
 
 
 class Task(Base):
@@ -216,6 +217,9 @@ SCHEMA_MIGRATIONS = {
         "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS attempt_id INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS lease_version INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS worker_session_id VARCHAR(120) NOT NULL DEFAULT ''",
+    ),
+    "20260720_workflow_created_at": (
+        "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
     ),
 }
 
@@ -438,7 +442,7 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
 @app.get("/api/workflows")
 def workflows(session: Session = Depends(db)):
     return [{"id": item.id, "title": item.title, "status": item.status, "engine": item.engine,
-             "graph_version": item.graph_version, "thread_id": item.thread_id} for item in session.scalars(select(Workflow))]
+             "graph_version": item.graph_version, "thread_id": item.thread_id} for item in session.scalars(select(Workflow).order_by(Workflow.created_at))]
 
 
 @app.get("/api/workflows/{workflow_id}")
@@ -476,10 +480,14 @@ def stage_task(session: Session, workflow_id: str, stage_key: str):
     return session.scalar(select(Task).where(Task.workflow_id == workflow_id, Task.stage_key == stage_key))
 
 
-def persist_stage_one_result(session: Session, workflow: Workflow, result: dict):
+def persist_stage_one_result(session: Session, workflow: Workflow, result: dict, *, simulate_workers: bool = False):
     """Project pure LangGraph events into the dashboard's business ledger."""
     task_by_node = {"team_lead": "team_lead", "contract_audit": "contract_audit", "frontend": "frontend", "audit": "audit"}
     for item in result.get("events", []):
+        # The graph's frontend/audit nodes are a deterministic loop test until
+        # the lease-based Codex Worker lands.  Never fake a real delivery.
+        if not simulate_workers and item["node"] in {"frontend", "audit"}:
+            continue
         duplicate = session.scalar(select(WorkflowEvent.id).where(WorkflowEvent.workflow_id == workflow.id,
                                                                    WorkflowEvent.idempotency_key == item["idempotency_key"]))
         if duplicate:
@@ -551,9 +559,10 @@ def run_stage_one(workflow_id: str, payload: dict | None = None, session: Sessio
     state["max_task_iterations"] = int(payload.get("max_task_iterations", 3))
     graph = build_stage_one_graph(checkpointer=checkpointer)
     result = graph.invoke(state, {"configurable": {"thread_id": workflow.thread_id, "checkpoint_ns": f"stage1:{run_id}"}})
-    persist_stage_one_result(session, workflow, result)
+    simulate_workers = bool(payload.get("simulate_workers", False))
+    persist_stage_one_result(session, workflow, result, simulate_workers=simulate_workers)
     response = {"workflow_id": workflow.id, "run_id": run_id, "status": workflow.status,
-                "stage_one_status": result.get("workflow_status"),
+                "stage_one_status": result.get("workflow_status") if simulate_workers else "contract_ready",
                 "contract_revision": result.get("contract_revision", 0),
                 "frontend_iterations": result.get("frontend_iterations", 0),
                 "events": len(result.get("events", []))}
@@ -679,6 +688,32 @@ def send_message(workflow_id: str, payload: dict, session: Session = Depends(db)
     return response
 
 
+@app.post("/api/workflows/{workflow_id}/tasks/{task_id}/start")
+def start_task(workflow_id: str, task_id: str, payload: dict | None = None, session: Session = Depends(db)):
+    task = session.get(Task, task_id)
+    if not task or task.workflow_id != workflow_id:
+        raise HTTPException(404, "task not found")
+    payload = payload or {}
+    idempotency_key = str(payload.get("idempotency_key", "")).strip()
+    previous = event_response(session, workflow_id, idempotency_key)
+    if previous is not None:
+        return previous
+    if task.status not in {"ready", "running"}:
+        raise HTTPException(409, "task is not ready")
+    task.status = "running"
+    task.attempt_id += 1
+    task.worker_session_id = str(payload.get("worker_session_id", "codex"))
+    response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id}
+    session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id,
+                            attempt_number=task.attempt_id, lease_version=task.lease_version, status="running",
+                            worker_session_id=task.worker_session_id,
+                            idempotency_key=idempotency_key or f"start_{task.id}_{task.attempt_id}"))
+    append_event(session, session.get(Workflow, workflow_id), "task.started", task_id=task.id,
+                 payload={"response": response}, idempotency_key=idempotency_key)
+    session.commit()
+    return response
+
+
 @app.post("/api/workflows/{workflow_id}/tasks/{task_id}/complete")
 def complete(workflow_id: str, task_id: str, payload: dict | None = None, session: Session = Depends(db)):
     task = session.get(Task, task_id)
@@ -689,7 +724,7 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     previous = event_response(session, workflow_id, idempotency_key)
     if previous is not None:
         return previous
-    if task.status != "ready":
+    if task.status not in {"ready", "running"}:
         raise HTTPException(409, "task is not ready")
     if task.iterations >= MAX_TASK_ITERATIONS:
         raise HTTPException(409, "task iteration limit reached")

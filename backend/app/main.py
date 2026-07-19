@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import String, create_engine, select
 from uuid import uuid4
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -15,6 +16,7 @@ class Workflow(Base):
 class Task(Base):
  __tablename__="workflow_tasks";id:Mapped[str]=mapped_column(String(80),primary_key=True);workflow_id:Mapped[str]=mapped_column(String(40));stage_key:Mapped[str]=mapped_column(String(80));agent_key:Mapped[str]=mapped_column(String(80));status:Mapped[str]=mapped_column(String(30));depends_on:Mapped[str]=mapped_column(String,default="")
 app=FastAPI(title="A2A Control Plane")
+app.add_middleware(CORSMiddleware,allow_origins=["http://127.0.0.1:5173","http://localhost:5173"],allow_methods=["*"],allow_headers=["*"])
 def db():
  with Local() as s:yield s
 @app.on_event("startup")

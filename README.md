@@ -8,7 +8,7 @@
 
 | 组件 | 技术 | 地址 | 数据 |
 | --- | --- | --- | --- |
-| Dashboard | Vue 3 + Vite | `http://127.0.0.1:5173` | 只读 FastAPI API |
+| Dashboard | Vue 3 + Vite | `http://127.0.0.1:20002` | 只读 FastAPI API |
 | Control Plane | FastAPI + LangGraph | `http://127.0.0.1:8010` | PostgreSQL 业务账本、Checkpoint、Outbox |
 | PostgreSQL | 已有 Docker PostgreSQL | 默认 `5432` | 数据库 `agent_to_agent` |
 
@@ -78,17 +78,17 @@ Set-Location frontend
 npm run dev -- --host 127.0.0.1
 ```
 
-打开 `http://127.0.0.1:5173`。首次启动会创建 SQLAlchemy 表、运行已提交的兼容迁移，并由 `PostgresSaver` 创建 LangGraph Checkpoint 表。不要用本地 JSON 作为账本。
+打开 `http://127.0.0.1:20002`。首次启动会创建 SQLAlchemy 表、运行已提交的兼容迁移，并由 `PostgresSaver` 创建 LangGraph Checkpoint 表。不要用本地 JSON 作为账本。
 
 ### 5. 启动前检查
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:8010/api/workflows | Select-Object StatusCode
-Invoke-WebRequest http://127.0.0.1:5173 | Select-Object StatusCode
+Invoke-WebRequest http://127.0.0.1:20002 | Select-Object StatusCode
 Set-Location frontend; npm run build; Set-Location ..
 ```
 
-三项均成功后再开始工作流。端口被占用时，先确认占用程序，再停止旧进程；不要同时启动两套 8010 或 5173 服务。
+三项均成功后再开始工作流。端口被占用时，先确认占用程序，再停止旧进程；不要同时启动两套 8010 或 20002 服务。
 
 ## 从 Codex 发起一个 A2A 任务
 
@@ -136,18 +136,18 @@ pg_dump -Fc -h 127.0.0.1 -p 5432 -U postgres -d agent_to_agent -f data\backups\a
 1. 阶段三：长任务 `interrupt()`、lease/fencing token、Worker 回调签名、Codex CLI + Git Worktree、PR 与部署。
 2. Redis 仅在确实需要队列、分布式锁、限流或高并发时再接入。
 
-历史 Node 4318 原型及 Vue 模板演示文件已移除，避免办公电脑误启动错误入口。当前唯一入口是本 README 的 FastAPI 8010 + Vite 5173 命令。
+历史 Node 4318 原型及 Vue 模板演示文件已移除，避免办公电脑误启动错误入口。当前唯一入口是本 README 的 FastAPI 8010 + Vite 20002 命令。
 
 ## 常见问题
 
 | 现象 | 处理 |
 | --- | --- |
-| Dashboard 显示 502 | 确认 `http://127.0.0.1:8010/api/workflows` 返回 200，再刷新 5173。短暂重启错误应在下次成功轮询后清除。 |
+| Dashboard 显示 502 | 确认 `http://127.0.0.1:8010/api/workflows` 返回 200，再刷新 20002。短暂重启错误应在下次成功轮询后清除。 |
 | Dashboard 空白或 Failed to fetch | 检查 8010、Vite 代理以及 `.env` 的 `DATABASE_URL`。 |
 | `password authentication failed` | 只修改本机 `.env` 的密码；不要修改代码或提交密码。 |
-| 端口 8010/5173 被占用 | 查明旧进程后停止它，再启动一套服务。 |
+| 端口 8010/20002 被占用 | 查明旧进程后停止它，再启动一套服务。 |
 | 节点显示已交付但没有证据 | 这是数据一致性缺陷；不要手工改状态，应创建修复任务并保留审计记录。 |
 
 ## 本次交付记录
 
-`execution_mode=direct`：更新跨电脑部署与运行说明、修正 Skill 和启动脚本的当前入口。验证证据：`npm run build` 通过；本地 `8010/api/workflows` 与 `5173/api/workflows` 均返回 200。
+`execution_mode=direct`：更新跨电脑部署与运行说明、修正 Skill 和启动脚本的当前入口。验证证据：`npm run build` 通过；本地 `8010/api/workflows` 与 `20002/api/workflows` 均返回 200。

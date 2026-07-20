@@ -3,7 +3,7 @@ import json
 import hashlib
 from pathlib import Path
 from uuid import uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 
 from app.langgraph_loop import GRAPH_VERSION, build_stage_one_graph, new_state
 
-for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
+env_file = Path(__file__).resolve().parents[2] / ".env"
+for line in env_file.read_text().splitlines() if env_file.exists() else []:
     key, _, value = line.partition("=")
     os.environ.setdefault(key, value)
 engine = create_engine(os.environ["DATABASE_URL"])
@@ -109,6 +110,24 @@ class TaskAttempt(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class WorkerJob(Base):
+    __tablename__ = "worker_jobs"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(40))
+    task_id: Mapped[str] = mapped_column(String(80), unique=True)
+    job_type: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(30), default="queued")
+    attempt_id: Mapped[int] = mapped_column(default=0)
+    lease_version: Mapped[int] = mapped_column(default=0)
+    worker_id: Mapped[str] = mapped_column(String(120), default="")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    callback_id: Mapped[str] = mapped_column(String(120), default="")
+    result_payload: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"), onupdate=lambda: datetime.now(timezone.utc))
+
+
 class WorkflowEvent(Base):
     __tablename__ = "workflow_events"
     __table_args__ = (UniqueConstraint("workflow_id", "sequence", name="uq_workflow_event_sequence"),
@@ -202,9 +221,15 @@ TEAM_BACKEND_ONLY = [
     ("test", "test-agent", "audit"),
     ("acceptance", "product-agent", "test"),
 ]
+TEAM_WORKFLOW_VALIDATION = [
+    ("workflow_validation", "test-agent", "team_lead"),
+    ("acceptance", "product-agent", "workflow_validation"),
+]
 MAX_TASK_ITERATIONS = 3
 MAX_REPEAT_MESSAGES = 3
 RECENT_MESSAGES = 12
+WORKER_JOB_TYPES = {"team_lead", "contract_audit", "frontend", "backend", "audit", "test", "workflow_validation"}
+WORKER_LEASE_SECONDS = 60
 
 # There is no Alembic project yet. Keep the compatibility migration explicit
 # and idempotent until the project adopts a real migration revision chain.
@@ -234,6 +259,9 @@ SCHEMA_MIGRATIONS = {
 
 def route_for(request: str):
     normalized = request.replace(" ", "")
+    is_flow_validation = "a2a" in normalized.lower() and any(flag in normalized for flag in ("验证", "自检", "流程测试", "流程验收"))
+    if is_flow_validation:
+        return "workflow_validation", TEAM_WORKFLOW_VALIDATION
     has_frontend = "前端" in normalized or "前后端" in normalized
     frontend_only = has_frontend and any(flag in normalized for flag in ("后端数据不修改", "后端不修改", "接口不变", "数据库不修改"))
     backend_only = "后端" in normalized and not has_frontend
@@ -288,6 +316,31 @@ def task_data(item: Task, details=False):
     return data
 
 
+def queue_worker_attempt(session: Session, workflow: Workflow, task: Task, *, event_type: str, detail: str):
+    """Create exactly one executable attempt for a task that has been reopened."""
+    if task.stage_key not in WORKER_JOB_TYPES:
+        return None
+    job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == task.id))
+    if job and job.status in {"queued", "leased", "running"} and job.attempt_id == task.attempt_id:
+        return job
+
+    task.attempt_id += 1
+    if not job:
+        job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow.id, task_id=task.id,
+                        job_type=task.stage_key)
+        session.add(job)
+    job.status, job.attempt_id, job.worker_id, job.callback_id = "queued", task.attempt_id, "", ""
+    job.lease_expires_at = job.heartbeat_at = None
+    job.result_payload = "{}"
+    session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow.id, task_id=task.id,
+                            attempt_number=task.attempt_id, lease_version=task.lease_version, status="queued",
+                            worker_session_id="", idempotency_key=f"{event_type}:{task.id}:{task.attempt_id}"))
+    append_event(session, workflow, event_type, task_id=task.id,
+                 payload={"attempt_id": task.attempt_id, "job_id": job.id, "detail": detail},
+                 idempotency_key=f"{event_type}:{task.id}:{task.attempt_id}")
+    return job
+
+
 def queue_repair_regression(session: Session, workflow: Workflow, owner: Task, content: str, source: Task | None = None):
     """Reopen one owner and only its downstream gates for a defect regression."""
     owner.status = "repairing"
@@ -295,6 +348,11 @@ def queue_repair_regression(session: Session, workflow: Workflow, owner: Task, c
     owner_log = decode(owner.execution_log)
     owner_log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "缺陷已接收", "detail": owner.instructions})
     owner.execution_log = json.dumps(owner_log, ensure_ascii=False)
+    repair_job = queue_worker_attempt(session, workflow, owner, event_type="task.repair.queued", detail=content)
+    if repair_job:
+        owner_log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "修复任务已排队",
+                          "detail": f"修复 attempt {owner.attempt_id} 已创建，Worker Job：{repair_job.id}"})
+        owner.execution_log = json.dumps(owner_log, ensure_ascii=False)
 
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow.id)).all()
     reopen = {owner.stage_key}
@@ -313,9 +371,10 @@ def queue_repair_regression(session: Session, workflow: Workflow, owner: Task, c
         log = decode(item.execution_log)
         log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "等待回归", "detail": f"等待 {owner.stage_key} 修复缺陷后重新执行。"})
         item.execution_log = json.dumps(log, ensure_ascii=False)
-    if source:
-        session.add(Message(workflow_id=workflow.id, task_id=owner.id, from_agent=source.agent_key,
-                            to_agent=owner.agent_key, kind="handoff", text=f"DEFECT 已接收，{owner.instructions}"))
+    sender = source.agent_key if source else "dashboard"
+    session.add(Message(workflow_id=workflow.id, task_id=owner.id, from_agent=sender,
+                        to_agent=owner.agent_key, kind="challenge",
+                        text=f"驳回/缺陷回派：{content}；已重新发布给 {owner.agent_key}，修复 Job 已排队。"))
 
 
 def audit_inputs_ready(session: Session, workflow_id: str, audit_task: Task, by_stage: dict[str, Task]) -> bool:
@@ -382,7 +441,7 @@ def refresh_summary(workflow: Workflow, messages: list[Message]):
         workflow.context_summary = f"已压缩 {len(older)} 条早期上下文；最近摘要：{older[-1].from_agent}→{older[-1].to_agent}：{older[-1].text[:120]}"
 
 app = FastAPI(title="A2A Control Plane")
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:20002", "http://localhost:20002"], allow_methods=["*"], allow_headers=["*"])
 
 
 def db():
@@ -425,6 +484,41 @@ def boot():
                 task.artifacts = json.dumps(detail["artifacts"], ensure_ascii=False)
                 task.execution_log = json.dumps(detail["execution_log"], ensure_ascii=False)
                 task.handoff_summary = detail["handoff_summary"]
+        for workflow in session.scalars(select(Workflow).where(Workflow.status == "running")):
+            acceptance = stage_task(session, workflow.id, "acceptance")
+            lead = stage_task(session, workflow.id, "team_lead")
+            if not acceptance or not lead or acceptance.status != "blocked" or not lead.instructions.startswith("验收驳回："):
+                continue
+            existing_job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == lead.id))
+            if lead.status in {"running", "repairing"} or (existing_job and existing_job.status in {"queued", "leased", "running"}):
+                continue
+            lead.status, lead.worker_session_id = "running", "replan-orchestrator"
+            lead.attempt_id += 1
+            if not existing_job:
+                existing_job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow.id, task_id=lead.id,
+                                         job_type="team_lead", attempt_id=lead.attempt_id, status="queued")
+                session.add(existing_job)
+            else:
+                existing_job.status, existing_job.attempt_id, existing_job.worker_id, existing_job.callback_id = "queued", lead.attempt_id, "", ""
+                existing_job.lease_expires_at = existing_job.heartbeat_at = None
+                existing_job.result_payload = "{}"
+            session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow.id, task_id=lead.id,
+                                    attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="running",
+                                    worker_session_id=lead.worker_session_id,
+                                    idempotency_key=f"replan_{lead.id}_{lead.attempt_id}"))
+        # A previous process may have stopped after a defect moved an owner to
+        # repairing but before its worker was queued. Recover that durable state.
+        for task in session.scalars(select(Task).where(Task.status == "repairing")):
+            workflow = session.get(Workflow, task.workflow_id)
+            defect = session.scalar(select(Defect).where(Defect.workflow_id == task.workflow_id,
+                                                          Defect.owner_agent == task.agent_key,
+                                                          Defect.status.in_(("open", "assigned", "reopened"))).order_by(Defect.created_at))
+            if workflow and defect:
+                queue_worker_attempt(session, workflow, task, event_type="task.repair.recovered", detail=defect.content)
+        for task in session.scalars(select(Task).where(Task.status == "ready", Task.stage_key.in_(WORKER_JOB_TYPES))):
+            workflow = session.get(Workflow, task.workflow_id)
+            if workflow and workflow.status == "running":
+                queue_worker_attempt(session, workflow, task, event_type="task.queued", detail="依赖已满足，等待 Worker 领取。")
         session.commit()
     checkpoint_url = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
     checkpointer_context = PostgresSaver.from_conn_string(checkpoint_url)
@@ -480,7 +574,8 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
                         title=payload["title"], request=payload["request"], context_summary="等待 Team Lead 产出方案与 REST API Contract。")
     session.add(workflow)
     route, stages = route_for(payload["request"])
-    for key, agent, dependencies in LEAD_GATE + stages:
+    lead_gate = [LEAD_GATE[0]] if route == "workflow_validation" else LEAD_GATE
+    for key, agent, dependencies in lead_gate + stages:
         detail = task_detail(key, workflow, route)
         session.add(Task(id=f"{workflow_id}_{key}", workflow_id=workflow_id, stage_key=key, agent_key=agent,
                          status="ready" if not dependencies else "blocked", depends_on=dependencies,
@@ -775,7 +870,16 @@ def start_task(workflow_id: str, task_id: str, payload: dict | None = None, sess
         task.status = "running"
     task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", "codex"))
-    response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id}
+    job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == task.id))
+    if task.stage_key in WORKER_JOB_TYPES:
+        if not job:
+            job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id, job_type=task.stage_key,
+                            attempt_id=task.attempt_id, status="queued")
+            session.add(job)
+        else:
+            job.status, job.attempt_id, job.worker_id, job.callback_id = "queued", task.attempt_id, "", ""
+            job.lease_expires_at = job.heartbeat_at = None
+    response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id, "job_id": job.id if job else ""}
     session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id,
                             attempt_number=task.attempt_id, lease_version=task.lease_version, status="running",
                             worker_session_id=task.worker_session_id,
@@ -784,6 +888,157 @@ def start_task(workflow_id: str, task_id: str, payload: dict | None = None, sess
                  payload={"response": response}, idempotency_key=idempotency_key)
     session.commit()
     return response
+
+
+def active_lease(job: WorkerJob, worker_id: str, attempt_id: int, lease_version: int):
+    return (job.worker_id == worker_id and job.attempt_id == attempt_id and job.lease_version == lease_version
+            and job.status in {"leased", "running"} and job.lease_expires_at and job.lease_expires_at > datetime.now(timezone.utc))
+
+
+def apply_replan(session: Session, workflow: Workflow, selected_stages: list[str], summary: str):
+    """Reopen only the stages selected by Team Lead and their dependent gates."""
+    tasks = session.scalars(select(Task).where(Task.workflow_id == workflow.id)).all()
+    by_stage = {task.stage_key: task for task in tasks}
+    valid_stages = set(by_stage) - {"team_lead", "acceptance"}
+    invalid = set(selected_stages) - valid_stages
+    if invalid or not selected_stages:
+        raise HTTPException(422, "replan requires one or more valid affected stages")
+    reopened = set(selected_stages)
+    changed = True
+    while changed:
+        changed = False
+        for task in tasks:
+            dependencies = set(filter(None, task.depends_on.split(",")))
+            if task.stage_key not in reopened and dependencies & reopened:
+                reopened.add(task.stage_key)
+                changed = True
+    reopened.discard("team_lead")
+    for stage in reopened:
+        task = by_stage[stage]
+        task.status = "blocked"
+        task.instructions = f"验收驳回后的重规划：{summary}"
+        log = decode(task.execution_log)
+        log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "重规划已选中", "detail": summary})
+        task.execution_log = json.dumps(log, ensure_ascii=False)
+    for stage in reopened:
+        task = by_stage[stage]
+        dependencies = task.depends_on.split(",") if task.depends_on else []
+        if all(by_stage[dependency].status == "passed" for dependency in dependencies):
+            task.status = "acceptance_pending_human" if stage == "acceptance" else "ready"
+    response = {"selected_stages": sorted(set(selected_stages)), "reopened_stages": sorted(reopened)}
+    append_event(session, workflow, "workflow.replanned", payload={"response": response, "summary": summary},
+                 idempotency_key=f"{workflow.id}:replan:{workflow.next_event_sequence + 1}")
+    for stage in sorted(reopened):
+        task = by_stage[stage]
+        session.add(Message(workflow_id=workflow.id, task_id=task.id, from_agent="team-lead", to_agent=task.agent_key,
+                            text=f"验收驳回后重规划：{summary}；{stage} 已重新排队。", kind="handoff"))
+    return response
+
+
+@app.post("/api/worker/jobs/claim")
+def claim_job(payload: dict, session: Session = Depends(db)):
+    worker_id = str(payload.get("worker_id", "")).strip()
+    if not worker_id:
+        raise HTTPException(422, "worker_id is required")
+    job_id = str(payload.get("job_id", "")).strip()
+    workflow_id = str(payload.get("workflow_id", "")).strip()
+    statement = select(WorkerJob).where(WorkerJob.status == "queued")
+    if job_id:
+        statement = statement.where(WorkerJob.id == job_id)
+    if workflow_id:
+        statement = statement.where(WorkerJob.workflow_id == workflow_id)
+    job = session.scalar(statement.order_by(WorkerJob.created_at).with_for_update(skip_locked=True))
+    if not job:
+        return {"job": None}
+    if job.job_type not in WORKER_JOB_TYPES:
+        raise HTTPException(409, "job type is not executable")
+    job.worker_id, job.lease_version, job.status = worker_id, job.lease_version + 1, "leased"
+    job.heartbeat_at = datetime.now(timezone.utc)
+    job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
+    task = session.get(Task, job.task_id)
+    task.lease_version, task.worker_session_id = job.lease_version, worker_id
+    attempt = session.scalar(select(TaskAttempt).where(TaskAttempt.task_id == task.id,
+                                                        TaskAttempt.attempt_number == job.attempt_id))
+    if attempt:
+        attempt.status, attempt.lease_version, attempt.worker_session_id = "running", job.lease_version, worker_id
+    session.commit()
+    return {"job": {"id": job.id, "workflow_id": job.workflow_id, "task_id": job.task_id, "job_type": job.job_type,
+                    "attempt_id": job.attempt_id, "lease_version": job.lease_version, "instructions": task.instructions}}
+
+
+@app.post("/api/worker/jobs/{job_id}/heartbeat")
+def heartbeat(job_id: str, payload: dict, session: Session = Depends(db)):
+    job = session.get(WorkerJob, job_id)
+    if not job or not active_lease(job, str(payload.get("worker_id", "")), int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1))):
+        raise HTTPException(409, "stale or expired lease")
+    job.status, job.heartbeat_at = "running", datetime.now(timezone.utc)
+    job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
+    session.commit()
+    return {"job_id": job.id, "lease_expires_at": job.lease_expires_at.isoformat()}
+
+
+@app.post("/api/worker/jobs/reap-expired")
+def reap_expired_jobs(session: Session = Depends(db)):
+    now = datetime.now(timezone.utc)
+    jobs = session.scalars(select(WorkerJob).where(WorkerJob.status.in_(("leased", "running")), WorkerJob.lease_expires_at < now)).all()
+    for job in jobs:
+        job.status, job.worker_id, job.lease_expires_at = "queued", "", None
+    session.commit()
+    return {"requeued": len(jobs)}
+
+
+@app.post("/api/worker/jobs/{job_id}/callback")
+def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
+    job = session.get(WorkerJob, job_id)
+    worker_id = str(payload.get("worker_id", ""))
+    attempt_id, lease_version = int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1))
+    callback_id = str(payload.get("callback_id", "")).strip()
+    if not job or not callback_id:
+        raise HTTPException(409, "stale, expired, or invalid callback")
+    if job.callback_id == callback_id:
+        recorded = decode(job.result_payload)
+        if (recorded.get("worker_id") == worker_id and recorded.get("attempt_id") == attempt_id
+                and recorded.get("lease_version") == lease_version):
+            task = session.get(Task, job.task_id)
+            return {"job_id": job.id, "status": job.status,
+                    "task": {"id": task.id, "status": task.status, "attempt_id": task.attempt_id} if task else None}
+        raise HTTPException(409, "callback payload does not match recorded result")
+    if not active_lease(job, worker_id, attempt_id, lease_version):
+        raise HTTPException(409, "stale, expired, or invalid callback")
+    if job.callback_id:
+        raise HTTPException(409, "job already has a callback")
+    outcome = str(payload.get("outcome", "")).lower()
+    evidence = str(payload.get("evidence", "")).strip()
+    if outcome not in {"succeeded", "failed"} or (outcome == "succeeded" and not evidence):
+        raise HTTPException(422, "callback requires succeeded|failed and success evidence")
+    job.callback_id, job.result_payload = callback_id, json.dumps(payload, ensure_ascii=False)
+    task = session.get(Task, job.task_id)
+    task.worker_session_id = worker_id
+    replan = payload.get("replan") if job.job_type == "team_lead" and task.instructions.startswith("验收驳回：") else None
+    if replan is not None and (not isinstance(replan, dict) or not isinstance(replan.get("affected_stages"), list)
+                               or not str(replan.get("summary", "")).strip()):
+        raise HTTPException(422, "replan callback requires affected_stages and summary")
+    if outcome == "failed":
+        job.status = "failed"
+        task.status = "repairing" if task.status == "repairing" else "ready"
+        attempt = session.scalar(select(TaskAttempt).where(TaskAttempt.task_id == task.id, TaskAttempt.attempt_number == task.attempt_id))
+        if attempt:
+            attempt.status, attempt.finished_at = "failed", datetime.now(timezone.utc)
+        append_event(session, session.get(Workflow, job.workflow_id), "job.failed", task_id=task.id,
+                     payload={"response": {"job_id": job.id, "status": job.status}, "error": str(payload.get("error", "worker failed"))},
+                     idempotency_key=f"job:{job.id}:callback:{callback_id}")
+        session.commit()
+        return {"job_id": job.id, "status": "failed"}
+    job.status = "callback_pending"
+    session.commit()
+    result = complete(job.workflow_id, job.task_id, {"worker_session_id": worker_id, "evidence": evidence,
+                                                      "idempotency_key": f"job:{job.id}:callback:{callback_id}"}, session)
+    if replan is not None:
+        result["replan"] = apply_replan(session, session.get(Workflow, job.workflow_id),
+                                         [str(stage) for stage in replan["affected_stages"]], str(replan["summary"]).strip())
+    job.status, job.lease_expires_at = "succeeded", None
+    session.commit()
+    return {"job_id": job.id, "status": "succeeded", "task": result}
 
 
 @app.post("/api/workflows/{workflow_id}/tasks/{task_id}/complete")
@@ -806,7 +1061,6 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     was_repairing = task.status == "repairing"
     task.status = "passed"
     task.iterations += 1
-    task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", ""))
     log = decode(task.execution_log)
     log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence,
@@ -814,6 +1068,13 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     if was_repairing:
         task.instructions = "缺陷修复已交付，等待审计复验。"
         log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "回归已排队", "detail": "修复已交付；下游审计与测试将按依赖重新执行。"})
+        for defect in session.scalars(select(Defect).where(Defect.workflow_id == workflow_id,
+                                                           Defect.owner_agent == task.agent_key,
+                                                           Defect.status.in_(("open", "assigned", "reopened")))):
+            defect.status = "fixed"
+        append_event(session, session.get(Workflow, workflow_id), "defect.fixed", task_id=task.id,
+                     payload={"owner_agent": task.agent_key, "attempt_id": task.attempt_id},
+                     idempotency_key=f"defect.fixed:{task.id}:{task.attempt_id}")
     task.execution_log = json.dumps(log, ensure_ascii=False)
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow_id)).all()
     by_stage = {item.stage_key: item for item in tasks}
@@ -824,13 +1085,20 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
             item.status = "acceptance_pending_human" if item.stage_key == "acceptance" else "ready"
             text = "测试已通过，等待人工验收决定。" if item.stage_key == "acceptance" else f"{task.stage_key} 已交付，{item.stage_key} 节点可以开始。"
             session.add(Message(workflow_id=workflow_id, task_id=task.id, from_agent=task.agent_key, to_agent=item.agent_key, text=text))
+            if item.status == "ready":
+                queue_worker_attempt(session, session.get(Workflow, workflow_id), item,
+                                     event_type="task.queued", detail=f"{task.stage_key} 已交付，依赖已满足。")
     if all(item.status == "passed" for item in tasks):
         session.get(Workflow, workflow_id).status = "completed"
     response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id}
-    session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id,
-                            attempt_number=task.attempt_id, lease_version=task.lease_version, status="passed",
-                            worker_session_id=task.worker_session_id,
-                            idempotency_key=idempotency_key or f"complete_{task.id}_{task.attempt_id}"))
+    attempt = session.scalar(select(TaskAttempt).where(TaskAttempt.task_id == task.id, TaskAttempt.attempt_number == task.attempt_id))
+    if attempt:
+        attempt.status, attempt.worker_session_id, attempt.finished_at = "passed", task.worker_session_id, datetime.now(timezone.utc)
+    else:
+        session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id,
+                                attempt_number=task.attempt_id, lease_version=task.lease_version, status="passed",
+                                worker_session_id=task.worker_session_id,
+                                idempotency_key=idempotency_key or f"complete_{task.id}_{task.attempt_id}", finished_at=datetime.now(timezone.utc)))
     append_event(session, session.get(Workflow, workflow_id), "task.passed", task_id=task.id,
                  payload={"response": response, "attempt_id": task.attempt_id}, idempotency_key=idempotency_key)
     session.commit()
@@ -863,10 +1131,26 @@ def acceptance_decision(workflow_id: str, payload: dict, session: Session = Depe
     else:
         acceptance.status = "blocked"
         lead = stage_task(session, workflow_id, "team_lead")
-        lead.status, lead.instructions = "ready", f"验收驳回：{reason}"
+        lead.status, lead.instructions = "running", f"验收驳回：{reason}\n必须读取驳回理由，产出重规划摘要，并仅选择受影响节点重新执行。"
+        lead.attempt_id += 1
+        lead.worker_session_id = "replan-orchestrator"
+        replan_job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == lead.id))
+        if not replan_job:
+            replan_job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow_id, task_id=lead.id,
+                                   job_type="team_lead", attempt_id=lead.attempt_id, status="queued")
+            session.add(replan_job)
+        else:
+            replan_job.status, replan_job.attempt_id, replan_job.worker_id, replan_job.callback_id = "queued", lead.attempt_id, "", ""
+            replan_job.lease_expires_at = replan_job.heartbeat_at = None
+            replan_job.result_payload = "{}"
+        session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=lead.id,
+                                attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="running",
+                                worker_session_id=lead.worker_session_id,
+                                idempotency_key=f"replan_{lead.id}_{lead.attempt_id}"))
         workflow.status = "running"
-        message = f"人工验收驳回：{reason}；已回到 Team Lead 协调。"
-    response = {"workflow_id": workflow_id, "decision": decision, "status": workflow.status, "actor": actor}
+        message = f"人工验收驳回：{reason}；已创建 Team Lead 重规划 Job。"
+    response = {"workflow_id": workflow_id, "decision": decision, "status": workflow.status, "actor": actor,
+                "replan_job_id": replan_job.id if decision == "REJECT" else ""}
     session.add(Message(workflow_id=workflow_id, task_id=acceptance.id, from_agent=actor, to_agent="team-lead" if decision == "REJECT" else "dashboard", text=message, kind="approval"))
     append_event(session, workflow, "acceptance.decided", task_id=acceptance.id,
                  payload={"response": response, "reason": reason}, idempotency_key=idempotency_key)
@@ -894,3 +1178,8 @@ def record_evidence(workflow_id: str, task_id: str, payload: dict, session: Sess
                  payload={"response": response, "evidence": evidence}, idempotency_key=idempotency_key)
     session.commit()
     return response
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8010)

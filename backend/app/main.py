@@ -234,8 +234,9 @@ SCHEMA_MIGRATIONS = {
 
 def route_for(request: str):
     normalized = request.replace(" ", "")
-    frontend_only = "前端" in normalized and any(flag in normalized for flag in ("后端数据不修改", "后端不修改", "接口不变", "数据库不修改"))
-    backend_only = "后端" in normalized and "前端" not in normalized
+    has_frontend = "前端" in normalized or "前后端" in normalized
+    frontend_only = has_frontend and any(flag in normalized for flag in ("后端数据不修改", "后端不修改", "接口不变", "数据库不修改"))
+    backend_only = "后端" in normalized and not has_frontend
     if frontend_only:
         return "frontend_only", TEAM_FRONTEND_ONLY
     if backend_only:
@@ -315,6 +316,22 @@ def queue_repair_regression(session: Session, workflow: Workflow, owner: Task, c
     if source:
         session.add(Message(workflow_id=workflow.id, task_id=owner.id, from_agent=source.agent_key,
                             to_agent=owner.agent_key, kind="handoff", text=f"DEFECT 已接收，{owner.instructions}"))
+
+
+def audit_inputs_ready(session: Session, workflow_id: str, audit_task: Task, by_stage: dict[str, Task]) -> bool:
+    """The persisted audit dependencies define this iteration's fan-in."""
+    selected = [by_stage[key] for key in audit_task.depends_on.split(",") if key]
+    if not selected or any(task.status != "passed" for task in selected):
+        return False
+    if session.scalar(select(Defect.id).where(Defect.workflow_id == workflow_id,
+                                              Defect.owner_agent.in_([task.agent_key for task in selected]),
+                                              Defect.status.in_(("open", "assigned", "reopened")))):
+        return False
+    for task in selected:
+        evidence = [item for item in decode(task.execution_log) if item.get("event") == "交付证据"]
+        if not any(item.get("attempt_id") == task.attempt_id for item in evidence):
+            return False
+    return True
 
 
 def task_detail(stage: str, workflow: Workflow, route: str):
@@ -792,7 +809,8 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     task.attempt_id += 1
     task.worker_session_id = str(payload.get("worker_session_id", ""))
     log = decode(task.execution_log)
-    log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence})
+    log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "交付证据", "detail": evidence,
+                "attempt_id": task.attempt_id})
     if was_repairing:
         task.instructions = "缺陷修复已交付，等待审计复验。"
         log.append({"at": datetime.now(timezone.utc).isoformat(), "event": "回归已排队", "detail": "修复已交付；下游审计与测试将按依赖重新执行。"})
@@ -801,9 +819,11 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
     by_stage = {item.stage_key: item for item in tasks}
     for item in tasks:
         dependencies = item.depends_on.split(",") if item.depends_on else []
-        if item.status == "blocked" and all(by_stage[dependency].status == "passed" for dependency in dependencies):
-            item.status = "ready"
-            session.add(Message(workflow_id=workflow_id, task_id=task.id, from_agent=task.agent_key, to_agent=item.agent_key, text=f"{task.stage_key} 已交付，{item.stage_key} 节点可以开始。"))
+        eligible = all(by_stage[dependency].status == "passed" for dependency in dependencies)
+        if item.status == "blocked" and eligible and (item.stage_key != "audit" or audit_inputs_ready(session, workflow_id, item, by_stage)):
+            item.status = "acceptance_pending_human" if item.stage_key == "acceptance" else "ready"
+            text = "测试已通过，等待人工验收决定。" if item.stage_key == "acceptance" else f"{task.stage_key} 已交付，{item.stage_key} 节点可以开始。"
+            session.add(Message(workflow_id=workflow_id, task_id=task.id, from_agent=task.agent_key, to_agent=item.agent_key, text=text))
     if all(item.status == "passed" for item in tasks):
         session.get(Workflow, workflow_id).status = "completed"
     response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id}
@@ -813,6 +833,43 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
                             idempotency_key=idempotency_key or f"complete_{task.id}_{task.attempt_id}"))
     append_event(session, session.get(Workflow, workflow_id), "task.passed", task_id=task.id,
                  payload={"response": response, "attempt_id": task.attempt_id}, idempotency_key=idempotency_key)
+    session.commit()
+    return response
+
+
+@app.post("/api/workflows/{workflow_id}/acceptance/decision")
+def acceptance_decision(workflow_id: str, payload: dict, session: Session = Depends(db)):
+    workflow = session.get(Workflow, workflow_id)
+    acceptance = stage_task(session, workflow_id, "acceptance")
+    if not workflow or not acceptance:
+        raise HTTPException(404, "acceptance task not found")
+    idempotency_key = str(payload.get("idempotency_key", "")).strip()
+    previous = event_response(session, workflow_id, idempotency_key)
+    if previous is not None:
+        return previous
+    decision = str(payload.get("decision", "")).upper()
+    actor, reason = str(payload.get("actor", "")).strip(), str(payload.get("reason", "")).strip()
+    if acceptance.status != "acceptance_pending_human" or decision not in {"PASS", "REJECT"} or not actor or not reason:
+        raise HTTPException(422, "pending acceptance requires PASS|REJECT, actor, and reason")
+    record = {"at": datetime.now(timezone.utc).isoformat(), "event": "人工验收", "decision": decision,
+              "actor": actor, "detail": reason}
+    log = decode(acceptance.execution_log)
+    log.append(record)
+    acceptance.execution_log = json.dumps(log, ensure_ascii=False)
+    if decision == "PASS":
+        acceptance.status = "passed"
+        workflow.status = "completed"
+        message = "人工验收通过，工作流已完成。"
+    else:
+        acceptance.status = "blocked"
+        lead = stage_task(session, workflow_id, "team_lead")
+        lead.status, lead.instructions = "ready", f"验收驳回：{reason}"
+        workflow.status = "running"
+        message = f"人工验收驳回：{reason}；已回到 Team Lead 协调。"
+    response = {"workflow_id": workflow_id, "decision": decision, "status": workflow.status, "actor": actor}
+    session.add(Message(workflow_id=workflow_id, task_id=acceptance.id, from_agent=actor, to_agent="team-lead" if decision == "REJECT" else "dashboard", text=message, kind="approval"))
+    append_event(session, workflow, "acceptance.decided", task_id=acceptance.id,
+                 payload={"response": response, "reason": reason}, idempotency_key=idempotency_key)
     session.commit()
     return response
 

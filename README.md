@@ -2,7 +2,7 @@
 
 一个可移植到其他 Windows 电脑的本地 A2A 控制平面：Codex 对话负责确认需求；FastAPI、PostgreSQL 和 LangGraph 记录工作流；Vue 3 + Vite Dashboard 展示节点、交接消息、缺陷与回归状态。
 
-> 当前可用范围：工作流账本、Team Lead / Contract Audit 闸门、前后端并行状态、缺陷回派与 Dashboard。阶段三的外部 Codex CLI Worker、Git Worktree、`interrupt()/Command(resume)`、自动 PR/部署尚未接入，不能把当前版本当作无人值守发布系统。
+> 当前可用范围：工作流账本、Team Lead / Contract Audit 闸门、前后端并行状态、基于持久化审计输入的 Audit fan-in、缺陷回派、人工验收闸门与 Dashboard。阶段三的外部 Codex CLI Worker、Git Worktree、`interrupt()/Command(resume)`、自动 PR/部署尚未接入，不能把当前版本当作无人值守发布系统。
 
 ## 架构与端口
 
@@ -96,8 +96,9 @@ Set-Location frontend; npm run build; Set-Location ..
 2. 每次写操作都明确选择 `A2A` 或 `主控直改`。选择只对当前任务有效。
 3. 选择 A2A 后，创建 Workflow 并打开 Dashboard；先给 Team Lead 写入输入，再启动 Team Lead 节点。
 4. Contract Audit 通过前，前端和后端不得开始；两者通过 Contract 后可并行。
-5. Audit/Test 产生 DEFECT 时，责任节点显示 `修复中` 和缺陷内容；修复后重新经过 Audit 与 Test。
-6. `passed` 必须有实际交付证据，不能用计划或模拟结果冒充。
+5. Audit/Test 产生 DEFECT 时，责任节点显示 `修复中` 和缺陷内容；修复后重新经过 Audit 与 Test。Audit 只在 `audit.depends_on` 指定的本轮交付均有当前 attempt 证据且无未解决缺陷时运行。
+6. Test 通过后进入 `acceptance_pending_human`；只能由人工通过 `POST /api/workflows/{workflow_id}/acceptance/decision` 决定 `PASS` 或 `REJECT`，不得由产品 Agent 自动标记验收通过。
+7. `passed` 必须有实际交付证据，不能用计划或模拟结果冒充。
 
 可用脚本创建 Workflow 并打开 Dashboard（仅在 Codex 已确认执行后运行）：
 
@@ -132,11 +133,10 @@ pg_dump -Fc -h 127.0.0.1 -p 5432 -U postgres -d agent_to_agent -f data\backups\a
 
 ## 当前开发边界与后续路线
 
-1. 阶段二：真实前后端并行、Audit/Test/Acceptance 回环的完整业务投影。
-2. 阶段三：长任务 `interrupt()`、lease/fencing token、Worker 回调签名、Codex CLI + Git Worktree、PR 与部署。
-3. Redis 仅在确实需要队列、分布式锁、限流或高并发时再接入。
+1. 阶段三：长任务 `interrupt()`、lease/fencing token、Worker 回调签名、Codex CLI + Git Worktree、PR 与部署。
+2. Redis 仅在确实需要队列、分布式锁、限流或高并发时再接入。
 
-旧的 Node `server.mjs` / `worker.mjs` 是历史 `node_legacy` 原型，不要用 `run-team.ps1` 启动当前 FastAPI Dashboard。当前入口是本 README 的 8010 + 5173 命令。
+历史 Node 4318 原型及 Vue 模板演示文件已移除，避免办公电脑误启动错误入口。当前唯一入口是本 README 的 FastAPI 8010 + Vite 5173 命令。
 
 ## 常见问题
 

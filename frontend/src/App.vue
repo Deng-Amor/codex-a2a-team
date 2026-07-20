@@ -52,7 +52,7 @@ const taskAgent = task => agents.value.find(agent => agent.key === task.agent) |
 const endpoint = task => { const point = position(taskAgent(task), 0); return [Number.parseFloat(point.left)+8, Number.parseFloat(point.top)+8] }
 const wireLinks = computed(() => tasks.value.flatMap(task => task.depends_on.map(parent => ({ task, parent:tasks.value.find(item => item.stage === parent) })).filter(link => link.parent)))
 const date = value => new Intl.DateTimeFormat('zh-CN', { year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(new Date(value)).replace(',', ' /')
-const statusText = status => ({ ready:'待执行', running:'执行中', repairing:'修复中', passed:'已交付', blocked:'等待依赖', skipped:'已跳过', not_applicable:'不适用', waiting:'等待方案' }[status] || status || '等待方案')
+const statusText = status => ({ ready:'待执行', running:'执行中', repairing:'修复中', acceptance_pending_human:'等待人工验收', passed:'已交付', blocked:'等待依赖', skipped:'已跳过', not_applicable:'不适用', waiting:'等待方案' }[status] || status || '等待方案')
 const messageFrom = message => message.from || message.from_agent || 'team-lead'
 const messageTo = message => message.to || message.to_agent || 'team-lead'
 function select(agent, event) {

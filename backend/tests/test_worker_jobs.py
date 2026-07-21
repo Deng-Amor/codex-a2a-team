@@ -60,11 +60,24 @@ class WorkerJobIntegrationTests(unittest.TestCase):
         self.assertEqual(started.status_code, 200, started.text)
         return workflow_id, task_id, started.json()["job_id"]
 
+    def claim(self, workflow_id, job_id, worker_id="worker-a", agent_key="team-lead"):
+        runtime_id = "runtime-" + worker_id
+        registered = self.client.post("/api/agent-runtimes/register", json={
+            "runtime_id": runtime_id, "agent_key": agent_key, "adapter": "codex",
+            "worker_id": worker_id, "session_ref": "test-session-" + worker_id,
+        })
+        self.assertEqual(registered.status_code, 200, registered.text)
+        response = self.client.post("/api/worker/jobs/claim", json={
+            "worker_id": worker_id, "runtime_id": runtime_id, "job_id": job_id, "workflow_id": workflow_id,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return runtime_id, response.json()["job"]
+
     def test_success_callback_is_idempotent_and_releases_contract_audit(self):
         workflow_id, task_id, job_id = self.create_started_job("idempotent-callback")
-        lease = self.client.post("/api/worker/jobs/claim", json={"worker_id": "worker-a", "job_id": job_id, "workflow_id": workflow_id}).json()["job"]
+        runtime_id, lease = self.claim(workflow_id, job_id)
         callback = {"worker_id": "worker-a", "attempt_id": lease["attempt_id"], "lease_version": lease["lease_version"],
-                    "callback_id": "callback-1", "outcome": "succeeded", "evidence": "test evidence"}
+                    "runtime_id": runtime_id, "callback_id": "callback-1", "outcome": "succeeded", "evidence": "test evidence"}
         first = self.client.post(f"/api/worker/jobs/{job_id}/callback", json=callback)
         duplicate = self.client.post(f"/api/worker/jobs/{job_id}/callback", json=callback)
         self.assertEqual(first.status_code, 200, first.text)
@@ -77,25 +90,25 @@ class WorkerJobIntegrationTests(unittest.TestCase):
 
     def test_expired_lease_requeues_and_rejects_old_worker(self):
         _, _, job_id = self.create_started_job("expired-lease")
-        old_lease = self.client.post("/api/worker/jobs/claim", json={"worker_id": "worker-old", "job_id": job_id}).json()["job"]
+        old_runtime, old_lease = self.claim("", job_id, "worker-old")
         with self.Local() as session:
             job = session.get(self.WorkerJob, job_id)
             job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
             session.commit()
         self.assertEqual(self.client.post("/api/worker/jobs/reap-expired").json()["requeued"], 1)
-        new_lease = self.client.post("/api/worker/jobs/claim", json={"worker_id": "worker-new", "job_id": job_id}).json()["job"]
+        new_runtime, new_lease = self.claim("", job_id, "worker-new")
         stale = {"worker_id": "worker-old", "attempt_id": old_lease["attempt_id"], "lease_version": old_lease["lease_version"],
-                 "callback_id": "stale", "outcome": "succeeded", "evidence": "must not write"}
+                 "runtime_id": old_runtime, "callback_id": "stale", "outcome": "succeeded", "evidence": "must not write"}
         self.assertEqual(self.client.post(f"/api/worker/jobs/{job_id}/callback", json=stale).status_code, 409)
         current = {"worker_id": "worker-new", "attempt_id": new_lease["attempt_id"], "lease_version": new_lease["lease_version"],
-                   "callback_id": "current", "outcome": "succeeded", "evidence": "new lease evidence"}
+                   "runtime_id": new_runtime, "callback_id": "current", "outcome": "succeeded", "evidence": "new lease evidence"}
         self.assertEqual(self.client.post(f"/api/worker/jobs/{job_id}/callback", json=current).status_code, 200)
 
     def test_failed_callback_returns_task_to_ready_and_is_idempotent(self):
         workflow_id, task_id, job_id = self.create_started_job("failed-callback")
-        lease = self.client.post("/api/worker/jobs/claim", json={"worker_id": "worker-failure", "job_id": job_id, "workflow_id": workflow_id}).json()["job"]
+        runtime_id, lease = self.claim(workflow_id, job_id, "worker-failure")
         callback = {"worker_id": "worker-failure", "attempt_id": lease["attempt_id"], "lease_version": lease["lease_version"],
-                    "callback_id": "failure-1", "outcome": "failed", "error": "intentional test failure"}
+                    "runtime_id": runtime_id, "callback_id": "failure-1", "outcome": "failed", "error": "intentional test failure"}
         self.assertEqual(self.client.post(f"/api/worker/jobs/{job_id}/callback", json=callback).status_code, 200)
         self.assertEqual(self.client.post(f"/api/worker/jobs/{job_id}/callback", json=callback).status_code, 200)
         task = self.client.get(f"/api/workflows/{workflow_id}/tasks/{task_id}").json()
@@ -116,9 +129,8 @@ class WorkerJobIntegrationTests(unittest.TestCase):
     def test_targeted_claim_does_not_lease_another_workflow_job(self):
         first_workflow, _, first_job = self.create_started_job("targeted-claim-first")
         second_workflow, _, second_job = self.create_started_job("targeted-claim-second")
-        claimed = self.client.post("/api/worker/jobs/claim", json={"worker_id": "targeted-worker", "job_id": second_job, "workflow_id": second_workflow})
-        self.assertEqual(claimed.status_code, 200, claimed.text)
-        self.assertEqual(claimed.json()["job"]["id"], second_job)
+        _, claimed = self.claim(second_workflow, second_job, "targeted-worker")
+        self.assertEqual(claimed["id"], second_job)
         with self.Local() as session:
             first = session.get(self.WorkerJob, first_job)
             self.assertEqual(first.workflow_id, first_workflow)
@@ -139,10 +151,10 @@ class WorkerJobIntegrationTests(unittest.TestCase):
         self.assertEqual(rejected.status_code, 200, rejected.text)
         replan_job_id = rejected.json()["replan_job_id"]
         self.assertTrue(replan_job_id)
-        lease = self.client.post("/api/worker/jobs/claim", json={"worker_id": "replan-worker", "job_id": replan_job_id, "workflow_id": workflow_id}).json()["job"]
+        runtime_id, lease = self.claim(workflow_id, replan_job_id, "replan-worker")
         self.assertEqual(lease["id"], replan_job_id)
         callback = {"worker_id": "replan-worker", "attempt_id": lease["attempt_id"], "lease_version": lease["lease_version"],
-                    "callback_id": "replan-callback", "outcome": "succeeded", "evidence": "replan reviewed rejection",
+                    "runtime_id": runtime_id, "callback_id": "replan-callback", "outcome": "succeeded", "evidence": "replan reviewed rejection",
                     "replan": {"affected_stages": ["frontend"], "summary": "fix the frontend issue and rerun its downstream gates"}}
         completed = self.client.post(f"/api/worker/jobs/{replan_job_id}/callback", json=callback)
         self.assertEqual(completed.status_code, 200, completed.text)
@@ -154,6 +166,26 @@ class WorkerJobIntegrationTests(unittest.TestCase):
         self.assertEqual(statuses["audit"], "blocked")
         self.assertEqual(statuses["test"], "blocked")
         self.assertEqual(statuses["acceptance"], "blocked")
+
+    def test_runtime_must_match_the_job_role(self):
+        workflow_id, _, job_id = self.create_started_job("role-gate")
+        registered = self.client.post("/api/agent-runtimes/register", json={
+            "runtime_id": "runtime-frontend", "agent_key": "frontend-agent", "adapter": "codex", "worker_id": "frontend-worker"})
+        self.assertEqual(registered.status_code, 200, registered.text)
+        claimed = self.client.post("/api/worker/jobs/claim", json={
+            "runtime_id": "runtime-frontend", "worker_id": "frontend-worker", "workflow_id": workflow_id, "job_id": job_id})
+        self.assertEqual(claimed.status_code, 200, claimed.text)
+        self.assertIsNone(claimed.json()["job"])
+
+    def test_busy_runtime_cannot_be_re_registered_and_exposes_workflow_binding(self):
+        workflow_id, _, job_id = self.create_started_job("runtime-binding")
+        runtime_id, _ = self.claim(workflow_id, job_id, "bound-worker")
+        replaced = self.client.post("/api/agent-runtimes/register", json={
+            "runtime_id": runtime_id, "agent_key": "frontend-agent", "adapter": "workbuddy", "worker_id": "bound-worker"})
+        self.assertEqual(replaced.status_code, 409, replaced.text)
+        runtime = next(item for item in self.client.get("/api/agent-runtimes").json() if item["id"] == runtime_id)
+        self.assertEqual(runtime["current_workflow_id"], workflow_id)
+        self.assertEqual(runtime["state"], "working")
 
 
 if __name__ == "__main__":

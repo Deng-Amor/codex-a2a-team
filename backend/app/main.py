@@ -1,7 +1,9 @@
 import os
 import json
 import hashlib
+import logging
 from pathlib import Path
+from threading import Event, Thread
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 
@@ -14,13 +16,19 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from app.langgraph_loop import GRAPH_VERSION, build_stage_one_graph, new_state
 
 env_file = Path(__file__).resolve().parents[2] / ".env"
-for line in env_file.read_text().splitlines() if env_file.exists() else []:
-    key, _, value = line.partition("=")
-    os.environ.setdefault(key, value)
+for line in env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []:
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip():
+        os.environ.setdefault(key.strip(), value.strip())
 engine = create_engine(os.environ["DATABASE_URL"])
 Local = sessionmaker(bind=engine)
 checkpointer_context = None
 checkpointer = None
+runtime_reaper_stop = Event()
+runtime_reaper_thread = None
 
 
 class Base(DeclarativeBase):
@@ -60,6 +68,22 @@ class Workflow(Base):
     next_event_sequence: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
     last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+
+
+class AgentRuntime(Base):
+    """A real, heartbeat-backed execution instance; never a planned DAG node."""
+    __tablename__ = "agent_runtimes"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    agent_key: Mapped[str] = mapped_column(String(80))
+    adapter: Mapped[str] = mapped_column(String(40))
+    worker_id: Mapped[str] = mapped_column(String(120), unique=True)
+    state: Mapped[str] = mapped_column(String(30), default="idle")
+    session_ref: Mapped[str] = mapped_column(String(200), default="")
+    worktree_path: Mapped[str] = mapped_column(String, default="")
+    current_job_id: Mapped[str] = mapped_column(String(80), default="")
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"), onupdate=lambda: datetime.now(timezone.utc))
 
 
 class Task(Base):
@@ -105,6 +129,8 @@ class TaskAttempt(Base):
     lease_version: Mapped[int] = mapped_column(default=0)
     status: Mapped[str] = mapped_column(String(30), default="recorded")
     worker_session_id: Mapped[str] = mapped_column(String(120), default="")
+    runtime_id: Mapped[str] = mapped_column(String(80), default="")
+    external_session_id: Mapped[str] = mapped_column(String(200), default="")
     idempotency_key: Mapped[str] = mapped_column(String(120), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -116,6 +142,8 @@ class WorkerJob(Base):
     workflow_id: Mapped[str] = mapped_column(String(40))
     task_id: Mapped[str] = mapped_column(String(80), unique=True)
     job_type: Mapped[str] = mapped_column(String(40))
+    required_agent_key: Mapped[str] = mapped_column(String(80), default="")
+    runtime_id: Mapped[str] = mapped_column(String(80), default="")
     status: Mapped[str] = mapped_column(String(30), default="queued")
     attempt_id: Mapped[int] = mapped_column(default=0)
     lease_version: Mapped[int] = mapped_column(default=0)
@@ -235,6 +263,7 @@ MAX_REPEAT_MESSAGES = 3
 RECENT_MESSAGES = 12
 WORKER_JOB_TYPES = {"team_lead", "contract_audit", "frontend", "backend", "audit", "test", "workflow_validation", "document_review"}
 WORKER_LEASE_SECONDS = 60
+AGENT_RUNTIME_TTL_SECONDS = 90
 
 # There is no Alembic project yet. Keep the compatibility migration explicit
 # and idempotent until the project adopts a real migration revision chain.
@@ -258,6 +287,13 @@ SCHEMA_MIGRATIONS = {
     "20260720_workflow_last_activity": (
         "ALTER TABLE workflows ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP",
         "UPDATE workflows SET last_activity_at = COALESCE((SELECT MAX(created_at) FROM workflow_events WHERE workflow_events.workflow_id = workflows.id), created_at)",
+    ),
+    "20260721_agent_runtime": (
+        "ALTER TABLE workflow_task_attempts ADD COLUMN IF NOT EXISTS runtime_id VARCHAR(80) NOT NULL DEFAULT ''",
+        "ALTER TABLE workflow_task_attempts ADD COLUMN IF NOT EXISTS external_session_id VARCHAR(200) NOT NULL DEFAULT ''",
+        "ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS required_agent_key VARCHAR(80) NOT NULL DEFAULT ''",
+        "ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS runtime_id VARCHAR(80) NOT NULL DEFAULT ''",
+        "UPDATE worker_jobs AS job SET required_agent_key = task.agent_key FROM workflow_tasks AS task WHERE job.task_id = task.id AND job.required_agent_key = ''",
     ),
 }
 
@@ -324,6 +360,45 @@ def task_data(item: Task, details=False):
     return data
 
 
+def runtime_is_live(runtime: AgentRuntime) -> bool:
+    return runtime.last_heartbeat_at >= datetime.now(timezone.utc) - timedelta(seconds=AGENT_RUNTIME_TTL_SECONDS)
+
+
+def runtime_data(session: Session, runtime: AgentRuntime):
+    live = runtime_is_live(runtime)
+    job = session.get(WorkerJob, runtime.current_job_id) if runtime.current_job_id else None
+    return {"id": runtime.id, "agent_key": runtime.agent_key, "adapter": runtime.adapter,
+            "worker_id": runtime.worker_id, "state": runtime.state if live else "offline",
+            "session_ref": runtime.session_ref, "worktree_path": runtime.worktree_path,
+            "current_job_id": runtime.current_job_id,
+            "current_workflow_id": job.workflow_id if job else "",
+            "last_heartbeat_at": runtime.last_heartbeat_at.isoformat(),
+            "live": live, "updated_at": runtime.updated_at.isoformat()}
+
+
+def reap_expired(session: Session) -> int:
+    now = datetime.now(timezone.utc)
+    jobs = session.scalars(select(WorkerJob).where(WorkerJob.status.in_(("leased", "running")),
+                                                   WorkerJob.lease_expires_at < now)).all()
+    for job in jobs:
+        runtime = session.get(AgentRuntime, job.runtime_id) if job.runtime_id else None
+        if runtime and runtime.current_job_id == job.id:
+            runtime.state, runtime.current_job_id = "idle", ""
+        job.status, job.worker_id, job.runtime_id, job.lease_expires_at = "queued", "", "", None
+    if jobs:
+        session.commit()
+    return len(jobs)
+
+
+def runtime_reaper_loop():
+    while not runtime_reaper_stop.wait(10):
+        try:
+            with Local() as session:
+                reap_expired(session)
+        except Exception:
+            logging.getLogger(__name__).exception("agent runtime reaper failed")
+
+
 def queue_worker_attempt(session: Session, workflow: Workflow, task: Task, *, event_type: str, detail: str):
     """Create exactly one executable attempt for a task that has been reopened."""
     if task.stage_key not in WORKER_JOB_TYPES:
@@ -335,9 +410,10 @@ def queue_worker_attempt(session: Session, workflow: Workflow, task: Task, *, ev
     task.attempt_id += 1
     if not job:
         job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow.id, task_id=task.id,
-                        job_type=task.stage_key)
+                        job_type=task.stage_key, required_agent_key=task.agent_key)
         session.add(job)
     job.status, job.attempt_id, job.worker_id, job.callback_id = "queued", task.attempt_id, "", ""
+    job.required_agent_key, job.runtime_id = task.agent_key, ""
     job.lease_expires_at = job.heartbeat_at = None
     job.result_payload = "{}"
     session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow.id, task_id=task.id,
@@ -469,7 +545,7 @@ def db():
 
 @app.on_event("startup")
 def boot():
-    global checkpointer_context, checkpointer
+    global checkpointer_context, checkpointer, runtime_reaper_thread
     Base.metadata.create_all(engine)
     with Local() as session:
         session.execute(sql("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(80) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
@@ -510,19 +586,21 @@ def boot():
             existing_job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == lead.id))
             if lead.status in {"running", "repairing"} or (existing_job and existing_job.status in {"queued", "leased", "running"}):
                 continue
-            lead.status, lead.worker_session_id = "running", "replan-orchestrator"
+            lead.status, lead.worker_session_id = "queued", ""
             lead.attempt_id += 1
             if not existing_job:
                 existing_job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow.id, task_id=lead.id,
-                                         job_type="team_lead", attempt_id=lead.attempt_id, status="queued")
+                                         job_type="team_lead", required_agent_key=lead.agent_key,
+                                         attempt_id=lead.attempt_id, status="queued")
                 session.add(existing_job)
             else:
                 existing_job.status, existing_job.attempt_id, existing_job.worker_id, existing_job.callback_id = "queued", lead.attempt_id, "", ""
+                existing_job.required_agent_key, existing_job.runtime_id = lead.agent_key, ""
                 existing_job.lease_expires_at = existing_job.heartbeat_at = None
                 existing_job.result_payload = "{}"
             session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow.id, task_id=lead.id,
-                                    attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="running",
-                                    worker_session_id=lead.worker_session_id,
+                                    attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="queued",
+                                    worker_session_id="", runtime_id="", external_session_id="",
                                     idempotency_key=f"replan_{lead.id}_{lead.attempt_id}"))
         # A previous process may have stopped after a defect moved an owner to
         # repairing but before its worker was queued. Recover that durable state.
@@ -542,11 +620,19 @@ def boot():
     checkpointer_context = PostgresSaver.from_conn_string(checkpoint_url)
     checkpointer = checkpointer_context.__enter__()
     checkpointer.setup()
+    runtime_reaper_stop.clear()
+    if not runtime_reaper_thread or not runtime_reaper_thread.is_alive():
+        runtime_reaper_thread = Thread(target=runtime_reaper_loop, name="agent-runtime-reaper", daemon=True)
+        runtime_reaper_thread.start()
 
 
 @app.on_event("shutdown")
 def close_checkpointer():
-    global checkpointer_context, checkpointer
+    global checkpointer_context, checkpointer, runtime_reaper_thread
+    runtime_reaper_stop.set()
+    if runtime_reaper_thread and runtime_reaper_thread.is_alive():
+        runtime_reaper_thread.join(timeout=2)
+    runtime_reaper_thread = None
     if checkpointer_context:
         checkpointer_context.__exit__(None, None, None)
         checkpointer_context = None
@@ -564,6 +650,55 @@ def add_agent(agent: dict, session: Session = Depends(db)):
     session.add(item)
     session.commit()
     return {"key": item.key, "name": item.name, "role": item.role}
+
+
+@app.get("/api/agent-runtimes")
+def agent_runtimes(session: Session = Depends(db)):
+    return [runtime_data(session, item) for item in session.scalars(select(AgentRuntime).order_by(AgentRuntime.updated_at.desc()))]
+
+
+@app.post("/api/agent-runtimes/register")
+def register_agent_runtime(payload: dict, session: Session = Depends(db)):
+    runtime_id = str(payload.get("runtime_id", "")).strip()
+    agent_key = str(payload.get("agent_key", "")).strip()
+    adapter = str(payload.get("adapter", "")).strip()
+    worker_id = str(payload.get("worker_id", "")).strip()
+    if not runtime_id or not agent_key or not adapter or not worker_id:
+        raise HTTPException(422, "runtime_id, agent_key, adapter, and worker_id are required")
+    if not session.scalar(select(Agent).where(Agent.key == agent_key)):
+        raise HTTPException(422, "agent_key is not registered")
+    runtime = session.get(AgentRuntime, runtime_id)
+    if runtime and runtime.worker_id != worker_id:
+        raise HTTPException(409, "runtime_id is already owned by another worker")
+    if runtime and runtime.current_job_id:
+        raise HTTPException(409, "busy runtime must use its heartbeat endpoint, not register")
+    duplicate_worker = session.scalar(select(AgentRuntime).where(AgentRuntime.worker_id == worker_id,
+                                                                  AgentRuntime.id != runtime_id))
+    if duplicate_worker:
+        raise HTTPException(409, "worker_id is already registered by another runtime")
+    if not runtime:
+        runtime = AgentRuntime(id=runtime_id, agent_key=agent_key, adapter=adapter, worker_id=worker_id)
+        session.add(runtime)
+    runtime.agent_key, runtime.adapter = agent_key, adapter
+    runtime.session_ref = str(payload.get("session_ref", runtime.session_ref)).strip()
+    runtime.worktree_path = str(payload.get("worktree_path", runtime.worktree_path)).strip()
+    runtime.state, runtime.last_heartbeat_at = "idle", datetime.now(timezone.utc)
+    session.commit()
+    return runtime_data(session, runtime)
+
+
+@app.post("/api/agent-runtimes/{runtime_id}/heartbeat")
+def runtime_heartbeat(runtime_id: str, payload: dict, session: Session = Depends(db)):
+    runtime = session.get(AgentRuntime, runtime_id)
+    if not runtime or runtime.worker_id != str(payload.get("worker_id", "")).strip():
+        raise HTTPException(409, "unknown runtime or worker")
+    runtime.last_heartbeat_at = datetime.now(timezone.utc)
+    if payload.get("session_ref") is not None:
+        runtime.session_ref = str(payload["session_ref"]).strip()
+    if payload.get("worktree_path") is not None:
+        runtime.worktree_path = str(payload["worktree_path"]).strip()
+    session.commit()
+    return runtime_data(session, runtime)
 
 
 @app.get("/api/workflow-stages")
@@ -883,25 +1018,26 @@ def start_task(workflow_id: str, task_id: str, payload: dict | None = None, sess
     previous = event_response(session, workflow_id, idempotency_key)
     if previous is not None:
         return previous
-    if task.status not in {"ready", "running", "repairing"}:
+    if task.status not in {"ready", "repairing"}:
         raise HTTPException(409, "task is not ready")
-    if task.status != "repairing":
-        task.status = "running"
+    task.status = "queued"
     task.attempt_id += 1
-    task.worker_session_id = str(payload.get("worker_session_id", "codex"))
+    task.worker_session_id = ""
     job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == task.id))
     if task.stage_key in WORKER_JOB_TYPES:
         if not job:
             job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id, job_type=task.stage_key,
-                            attempt_id=task.attempt_id, status="queued")
+                            required_agent_key=task.agent_key, attempt_id=task.attempt_id, status="queued")
             session.add(job)
         else:
             job.status, job.attempt_id, job.worker_id, job.callback_id = "queued", task.attempt_id, "", ""
+            job.required_agent_key, job.runtime_id = task.agent_key, ""
             job.lease_expires_at = job.heartbeat_at = None
-    response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id, "job_id": job.id if job else ""}
+    response = {"id": task.id, "status": task.status, "attempt_id": task.attempt_id, "job_id": job.id if job else "",
+                "required_agent_key": task.agent_key}
     session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=task.id,
-                            attempt_number=task.attempt_id, lease_version=task.lease_version, status="running",
-                            worker_session_id=task.worker_session_id,
+                            attempt_number=task.attempt_id, lease_version=task.lease_version, status="queued",
+                            worker_session_id="", runtime_id="", external_session_id="",
                             idempotency_key=idempotency_key or f"start_{task.id}_{task.attempt_id}"))
     append_event(session, session.get(Workflow, workflow_id), "task.started", task_id=task.id,
                  payload={"response": response}, idempotency_key=idempotency_key)
@@ -957,11 +1093,17 @@ def apply_replan(session: Session, workflow: Workflow, selected_stages: list[str
 @app.post("/api/worker/jobs/claim")
 def claim_job(payload: dict, session: Session = Depends(db)):
     worker_id = str(payload.get("worker_id", "")).strip()
-    if not worker_id:
-        raise HTTPException(422, "worker_id is required")
+    runtime_id = str(payload.get("runtime_id", "")).strip()
+    if not worker_id or not runtime_id:
+        raise HTTPException(422, "worker_id and runtime_id are required")
+    runtime = session.execute(select(AgentRuntime).where(AgentRuntime.id == runtime_id).with_for_update()).scalar_one_or_none()
+    if not runtime or runtime.worker_id != worker_id or not runtime_is_live(runtime):
+        raise HTTPException(409, "runtime is unknown, owned by another worker, or offline")
+    if runtime.state == "working" or runtime.current_job_id:
+        raise HTTPException(409, "runtime already owns a job")
     job_id = str(payload.get("job_id", "")).strip()
     workflow_id = str(payload.get("workflow_id", "")).strip()
-    statement = select(WorkerJob).where(WorkerJob.status == "queued")
+    statement = select(WorkerJob).where(WorkerJob.status == "queued", WorkerJob.required_agent_key == runtime.agent_key)
     if job_id:
         statement = statement.where(WorkerJob.id == job_id)
     if workflow_id:
@@ -971,45 +1113,50 @@ def claim_job(payload: dict, session: Session = Depends(db)):
         return {"job": None}
     if job.job_type not in WORKER_JOB_TYPES:
         raise HTTPException(409, "job type is not executable")
-    job.worker_id, job.lease_version, job.status = worker_id, job.lease_version + 1, "leased"
+    job.worker_id, job.runtime_id, job.lease_version, job.status = worker_id, runtime.id, job.lease_version + 1, "leased"
     job.heartbeat_at = datetime.now(timezone.utc)
     job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
     task = session.get(Task, job.task_id)
-    task.lease_version, task.worker_session_id = job.lease_version, worker_id
+    task.status, task.lease_version = "running", job.lease_version
+    task.worker_session_id = runtime.session_ref or worker_id
+    runtime.state, runtime.current_job_id, runtime.last_heartbeat_at = "working", job.id, job.heartbeat_at
     attempt = session.scalar(select(TaskAttempt).where(TaskAttempt.task_id == task.id,
                                                         TaskAttempt.attempt_number == job.attempt_id))
     if attempt:
-        attempt.status, attempt.lease_version, attempt.worker_session_id = "running", job.lease_version, worker_id
+        attempt.status, attempt.lease_version = "running", job.lease_version
+        attempt.worker_session_id, attempt.runtime_id, attempt.external_session_id = worker_id, runtime.id, runtime.session_ref
     session.commit()
     return {"job": {"id": job.id, "workflow_id": job.workflow_id, "task_id": job.task_id, "job_type": job.job_type,
-                    "attempt_id": job.attempt_id, "lease_version": job.lease_version, "instructions": task.instructions}}
+                    "required_agent_key": job.required_agent_key, "attempt_id": job.attempt_id,
+                    "lease_version": job.lease_version, "instructions": task.instructions}}
 
 
 @app.post("/api/worker/jobs/{job_id}/heartbeat")
 def heartbeat(job_id: str, payload: dict, session: Session = Depends(db)):
     job = session.get(WorkerJob, job_id)
-    if not job or not active_lease(job, str(payload.get("worker_id", "")), int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1))):
+    runtime_id = str(payload.get("runtime_id", "")).strip()
+    runtime = session.get(AgentRuntime, runtime_id) if runtime_id else None
+    if (not job or not runtime or job.runtime_id != runtime_id or runtime.worker_id != str(payload.get("worker_id", ""))
+            or not active_lease(job, runtime.worker_id, int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1)))):
         raise HTTPException(409, "stale or expired lease")
     job.status, job.heartbeat_at = "running", datetime.now(timezone.utc)
     job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
+    runtime.last_heartbeat_at = job.heartbeat_at
     session.commit()
     return {"job_id": job.id, "lease_expires_at": job.lease_expires_at.isoformat()}
 
 
 @app.post("/api/worker/jobs/reap-expired")
 def reap_expired_jobs(session: Session = Depends(db)):
-    now = datetime.now(timezone.utc)
-    jobs = session.scalars(select(WorkerJob).where(WorkerJob.status.in_(("leased", "running")), WorkerJob.lease_expires_at < now)).all()
-    for job in jobs:
-        job.status, job.worker_id, job.lease_expires_at = "queued", "", None
-    session.commit()
-    return {"requeued": len(jobs)}
+    return {"requeued": reap_expired(session)}
 
 
 @app.post("/api/worker/jobs/{job_id}/callback")
 def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
     job = session.get(WorkerJob, job_id)
     worker_id = str(payload.get("worker_id", ""))
+    runtime_id = str(payload.get("runtime_id", "")).strip()
+    runtime = session.get(AgentRuntime, runtime_id) if runtime_id else None
     attempt_id, lease_version = int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1))
     callback_id = str(payload.get("callback_id", "")).strip()
     if not job or not callback_id:
@@ -1022,7 +1169,8 @@ def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
             return {"job_id": job.id, "status": job.status,
                     "task": {"id": task.id, "status": task.status, "attempt_id": task.attempt_id} if task else None}
         raise HTTPException(409, "callback payload does not match recorded result")
-    if not active_lease(job, worker_id, attempt_id, lease_version):
+    if (not runtime or runtime.worker_id != worker_id or job.runtime_id != runtime_id
+            or not active_lease(job, worker_id, attempt_id, lease_version)):
         raise HTTPException(409, "stale, expired, or invalid callback")
     if job.callback_id:
         raise HTTPException(409, "job already has a callback")
@@ -1032,7 +1180,7 @@ def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
         raise HTTPException(422, "callback requires succeeded|failed and success evidence")
     job.callback_id, job.result_payload = callback_id, json.dumps(payload, ensure_ascii=False)
     task = session.get(Task, job.task_id)
-    task.worker_session_id = worker_id
+    task.worker_session_id = runtime.session_ref or worker_id
     replan = payload.get("replan") if job.job_type == "team_lead" and task.instructions.startswith("验收驳回：") else None
     if replan is not None and (not isinstance(replan, dict) or not isinstance(replan.get("affected_stages"), list)
                                or not str(replan.get("summary", "")).strip()):
@@ -1040,6 +1188,7 @@ def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
     if outcome == "failed":
         job.status = "failed"
         task.status = "repairing" if task.status == "repairing" else "ready"
+        runtime.state, runtime.current_job_id = "idle", ""
         attempt = session.scalar(select(TaskAttempt).where(TaskAttempt.task_id == task.id, TaskAttempt.attempt_number == task.attempt_id))
         if attempt:
             attempt.status, attempt.finished_at = "failed", datetime.now(timezone.utc)
@@ -1049,19 +1198,24 @@ def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
         session.commit()
         return {"job_id": job.id, "status": "failed"}
     job.status = "callback_pending"
-    session.commit()
-    result = complete(job.workflow_id, job.task_id, {"worker_session_id": worker_id, "evidence": evidence,
-                                                      "idempotency_key": f"job:{job.id}:callback:{callback_id}"}, session)
+    result = complete_task(job.workflow_id, job.task_id, {"worker_session_id": worker_id, "evidence": evidence,
+                                                           "idempotency_key": f"job:{job.id}:callback:{callback_id}"}, session,
+                           commit=False)
     if replan is not None:
         result["replan"] = apply_replan(session, session.get(Workflow, job.workflow_id),
                                          [str(stage) for stage in replan["affected_stages"]], str(replan["summary"]).strip())
     job.status, job.lease_expires_at = "succeeded", None
+    runtime.state, runtime.current_job_id = "idle", ""
     session.commit()
     return {"job_id": job.id, "status": "succeeded", "task": result}
 
 
 @app.post("/api/workflows/{workflow_id}/tasks/{task_id}/complete")
 def complete(workflow_id: str, task_id: str, payload: dict | None = None, session: Session = Depends(db)):
+    return complete_task(workflow_id, task_id, payload, session)
+
+
+def complete_task(workflow_id: str, task_id: str, payload: dict | None, session: Session, *, commit: bool = True):
     task = session.get(Task, task_id)
     if not task or task.workflow_id != workflow_id:
         raise HTTPException(404, "task not found")
@@ -1120,7 +1274,8 @@ def complete(workflow_id: str, task_id: str, payload: dict | None = None, sessio
                                 idempotency_key=idempotency_key or f"complete_{task.id}_{task.attempt_id}", finished_at=datetime.now(timezone.utc)))
     append_event(session, session.get(Workflow, workflow_id), "task.passed", task_id=task.id,
                  payload={"response": response, "attempt_id": task.attempt_id}, idempotency_key=idempotency_key)
-    session.commit()
+    if commit:
+        session.commit()
     return response
 
 
@@ -1150,21 +1305,23 @@ def acceptance_decision(workflow_id: str, payload: dict, session: Session = Depe
     else:
         acceptance.status = "blocked"
         lead = stage_task(session, workflow_id, "team_lead")
-        lead.status, lead.instructions = "running", f"验收驳回：{reason}\n必须读取驳回理由，产出重规划摘要，并仅选择受影响节点重新执行。"
+        lead.status, lead.instructions = "queued", f"验收驳回：{reason}\n必须读取驳回理由，产出重规划摘要，并仅选择受影响节点重新执行。"
         lead.attempt_id += 1
-        lead.worker_session_id = "replan-orchestrator"
+        lead.worker_session_id = ""
         replan_job = session.scalar(select(WorkerJob).where(WorkerJob.task_id == lead.id))
         if not replan_job:
             replan_job = WorkerJob(id="job_" + uuid4().hex, workflow_id=workflow_id, task_id=lead.id,
-                                   job_type="team_lead", attempt_id=lead.attempt_id, status="queued")
+                                   job_type="team_lead", required_agent_key=lead.agent_key,
+                                   attempt_id=lead.attempt_id, status="queued")
             session.add(replan_job)
         else:
             replan_job.status, replan_job.attempt_id, replan_job.worker_id, replan_job.callback_id = "queued", lead.attempt_id, "", ""
+            replan_job.required_agent_key, replan_job.runtime_id = lead.agent_key, ""
             replan_job.lease_expires_at = replan_job.heartbeat_at = None
             replan_job.result_payload = "{}"
         session.add(TaskAttempt(id="attempt_" + uuid4().hex, workflow_id=workflow_id, task_id=lead.id,
-                                attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="running",
-                                worker_session_id=lead.worker_session_id,
+                                attempt_number=lead.attempt_id, lease_version=lead.lease_version, status="queued",
+                                worker_session_id="", runtime_id="", external_session_id="",
                                 idempotency_key=f"replan_{lead.id}_{lead.attempt_id}"))
         workflow.status = "running"
         message = f"人工验收驳回：{reason}；已创建 Team Lead 重规划 Job。"

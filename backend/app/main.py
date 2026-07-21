@@ -127,6 +127,7 @@ class EvidenceReceipt(Base):
     callback_id: Mapped[str] = mapped_column(String(160))
     outcome: Mapped[str] = mapped_column(String(20))
     evidence: Mapped[str] = mapped_column(Text)
+    callback_sha256: Mapped[str] = mapped_column(String(64), default="")
     binding_id: Mapped[str] = mapped_column(String(80))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
 
@@ -350,6 +351,7 @@ SCHEMA_MIGRATIONS = {
         "CREATE TABLE IF NOT EXISTS runner_idempotency_receipts (id VARCHAR(80) PRIMARY KEY, actor_id VARCHAR(160) NOT NULL, endpoint VARCHAR(240) NOT NULL, idempotency_key VARCHAR(200) NOT NULL, request_sha256 VARCHAR(64) NOT NULL, status_code INTEGER NOT NULL, response_payload TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT uq_runner_receipt_actor_endpoint_key UNIQUE(actor_id, endpoint, idempotency_key))",
         "CREATE TABLE IF NOT EXISTS runner_evidence_receipts (id VARCHAR(80) PRIMARY KEY, job_id VARCHAR(80) NOT NULL, attempt_id INTEGER NOT NULL, lease_version INTEGER NOT NULL, callback_id VARCHAR(160) NOT NULL, outcome VARCHAR(20) NOT NULL, evidence TEXT NOT NULL, binding_id VARCHAR(80) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT uq_runner_evidence_callback UNIQUE(job_id, callback_id))",
         "CREATE INDEX IF NOT EXISTS ix_runner_binding_workflow_task ON runner_bindings(workflow_id, task_id, attempt_id)",
+        "ALTER TABLE runner_evidence_receipts ADD COLUMN IF NOT EXISTS callback_sha256 VARCHAR(64) NOT NULL DEFAULT ''",
     ),
 }
 
@@ -1318,13 +1320,13 @@ def v1_callback(job_id: str, payload: dict, authorization: str = Header(default=
     if not job: runner_error(404, "not_found", "job not found")
     callback_id = str(payload.get("callback_id", "")).strip()
     if not callback_id: runner_error(422, "validation_error", "callback_id is required")
-    existing = session.scalar(select(EvidenceReceipt).where(EvidenceReceipt.job_id == job_id, EvidenceReceipt.callback_id == callback_id))
-    if existing:
-        if existing.evidence != canonical_json(payload.get("evidence", {})): runner_error(409, "callback_conflict", "callback_id payload differs")
-        return {"job_id": job_id, "status": existing.outcome, "evidence_receipt_id": existing.id}
     runtime = session.get(AgentRuntime, str(payload.get("runtime_id", "")).strip())
     if not runtime: runner_error(404, "not_found", "runtime not found")
     authorized(claims, runtime, workflow_id=job.workflow_id, task_id=job.task_id)
+    existing = session.scalar(select(EvidenceReceipt).where(EvidenceReceipt.job_id == job_id, EvidenceReceipt.callback_id == callback_id))
+    if existing:
+        if existing.callback_sha256 != payload_hash(canonical_json(payload)): runner_error(409, "callback_conflict", "callback_id payload differs")
+        return {"job_id": job_id, "status": existing.outcome, "evidence_receipt_id": existing.id}
     endpoint = f"/api/v1/worker/jobs/{job_id}/callback"; replay, digest = receipt(session, claims["worker_id"], endpoint, idempotency_key, payload)
     if replay: return replay
     _, runtime = v1_active_job(session, claims, job_id, payload, "job:callback")
@@ -1333,7 +1335,7 @@ def v1_callback(job_id: str, payload: dict, authorization: str = Header(default=
     if outcome == "succeeded": require_evidence(payload.get("evidence"))
     elif not isinstance(payload.get("error"), dict): runner_error(422, "validation_error", "failed callback requires structured error")
     binding = session.scalar(select(RunnerBinding).where(RunnerBinding.workflow_id == job.workflow_id, RunnerBinding.task_id == job.task_id, RunnerBinding.attempt_id == job.attempt_id))
-    evidence = canonical_json(payload.get("evidence", {})); evidence_receipt = EvidenceReceipt(id="evidence_" + uuid4().hex, job_id=job.id, attempt_id=job.attempt_id, lease_version=job.lease_version, callback_id=callback_id, outcome=outcome, evidence=evidence, binding_id=binding.id); session.add(evidence_receipt)
+    evidence = canonical_json(payload.get("evidence", {})); evidence_receipt = EvidenceReceipt(id="evidence_" + uuid4().hex, job_id=job.id, attempt_id=job.attempt_id, lease_version=job.lease_version, callback_id=callback_id, outcome=outcome, evidence=evidence, callback_sha256=payload_hash(canonical_json(payload)), binding_id=binding.id); session.add(evidence_receipt)
     if outcome == "failed": job.status, runtime.state, runtime.current_job_id = "failed", "idle", ""; response = {"job_id": job.id, "status": "failed", "evidence_receipt_id": evidence_receipt.id}
     else:
         job.callback_id, job.status, job.lease_expires_at, runtime.state, runtime.current_job_id = callback_id, "callback_pending", None, "idle", ""

@@ -52,7 +52,17 @@ def main():
         command = [os.environ.get("CODEX_CLI", "codex"), "exec", claimed["instructions"]]
         started = iso()
         # shell=False is deliberate: instructions never become shell syntax.
-        result = subprocess.run(command, shell=False, cwd=claimed["binding"]["worktree_path"], capture_output=True, text=True, timeout=int(os.environ.get("CODEX_JOB_TIMEOUT_SECONDS", "3600")))
+        process = subprocess.Popen(command, shell=False, cwd=claimed["binding"]["worktree_path"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + int(os.environ.get("CODEX_JOB_TIMEOUT_SECONDS", "3600"))
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                break
+            time.sleep(15)
+            call(f"/api/v1/worker/jobs/{claimed['id']}/heartbeat", {"runtime_id": RUNTIME_ID,
+                 "attempt_id": claimed["attempt_id"], "lease_version": claimed["lease_version"]}, "job-heartbeat-" + str(time.time_ns()))
+        stdout, stderr = process.communicate()
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         finished = iso()
         body = {"runtime_id": RUNTIME_ID, "attempt_id": claimed["attempt_id"], "lease_version": claimed["lease_version"],
                 "callback_id": "callback-" + hashlib.sha256((claimed["id"] + finished).encode()).hexdigest()[:32],

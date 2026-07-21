@@ -32,6 +32,7 @@ class CodexRunnerContractTests(unittest.TestCase):
         source = WORKER.read_text(encoding="utf-8")
         self.assertIn('"codex"', source)
         self.assertIn("shell=False", source)
+        self.assertIn("/jobs/{claimed['id']}/heartbeat", source)
         self.assertNotIn("workbuddy", source.lower())
 
     def test_migration_registry_and_immutable_receipts_are_present(self):
@@ -41,6 +42,7 @@ class CodexRunnerContractTests(unittest.TestCase):
         self.assertIn("uq_runner_receipt_actor_endpoint_key", source)
         self.assertIn("uq_runner_evidence_callback", source)
         self.assertIn("canonical_json", source)
+        self.assertIn("callback_sha256", source)
 
     def test_structured_evidence_rejects_uncontracted_properties(self):
         source = MAIN.read_text(encoding="utf-8")

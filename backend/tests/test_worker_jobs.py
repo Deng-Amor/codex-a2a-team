@@ -107,6 +107,12 @@ class WorkerJobIntegrationTests(unittest.TestCase):
         detail = self.client.get(f"/api/workflows/{workflow.json()['id']}").json()
         self.assertEqual({task["stage"] for task in detail["tasks"]}, {"team_lead", "workflow_validation", "acceptance"})
 
+    def test_prd_uses_document_review_without_contract_audit(self):
+        workflow = self.client.post("/api/workflows", json={"title": "prd", "request": "编写 A2A 流程 PRD 产品需求文档"})
+        self.assertEqual(workflow.status_code, 200, workflow.text)
+        detail = self.client.get(f"/api/workflows/{workflow.json()['id']}").json()
+        self.assertEqual({task["stage"] for task in detail["tasks"]}, {"team_lead", "document_review", "acceptance"})
+
     def test_targeted_claim_does_not_lease_another_workflow_job(self):
         first_workflow, _, first_job = self.create_started_job("targeted-claim-first")
         second_workflow, _, second_job = self.create_started_job("targeted-claim-second")

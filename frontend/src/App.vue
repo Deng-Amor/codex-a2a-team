@@ -2,12 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 const agents = ref([]), workflows = ref([]), workflow = ref(null), workflowId = ref(''), followLatest = ref(true), tasks = ref([]), messages = ref([]), selected = ref(null), error = ref(''), floor = ref(null), detailStyle = ref({}), menuOpen = ref(false), acceptanceReason = ref('')
-const meta = { 'team-lead':['Team Lead','#172554',6,9], 'contract-audit':['方案审计','#dc981f',36,10], 'task-decomposer':['任务拆分','#8b5cf6',6,38], 'architecture-agent':['架构设计','#3b82f6',36,31], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,66], 'backend-agent':['后端开发','#0d9ab7',66,66], 'audit-agent':['代码审计','#dc981f',66,40], 'test-agent':['测试验证','#e15b93',6,66], 'deployment-agent':['部署发布','#374151',36,40] }
-const virtualNodes = [{ key:'team-lead', name:'Team Lead', role:'lead' }, { key:'contract-audit', name:'方案审计', role:'contract audit' }]
+const meta = { 'team-lead':['Team Lead','#172554',6,9], 'task-decomposer':['任务拆分','#8b5cf6',6,38], 'architecture-agent':['架构设计','#3b82f6',36,31], 'product-agent':['产品验收','#e15b93',66,10], 'frontend-agent':['前端开发','#16a36e',36,66], 'backend-agent':['后端开发','#0d9ab7',66,66], 'audit-agent':['代码审计','#dc981f',66,40], 'test-agent':['测试验证','#e15b93',6,66], 'deployment-agent':['部署发布','#374151',36,40] }
+const stageNames = { team_lead:'Team Lead', contract_audit:'方案审计', document_review:'文档评审', workflow_validation:'流程验证', frontend:'前端开发', backend:'后端开发', audit:'代码审计', test:'测试验证', acceptance:'产品验收' }
+const stagePositions = { team_lead:[6,9], contract_audit:[36,10], document_review:[36,38], workflow_validation:[36,38], acceptance:[66,10], frontend:[36,66], backend:[66,66], audit:[66,40], test:[6,66] }
 const currentTask = agent => {
-  if (agent.key === 'team-lead') return tasks.value.find(task => task.agent === 'team-lead' || task.stage === 'team_lead')
-  if (agent.key === 'contract-audit') return tasks.value.find(task => task.stage === 'contract_audit')
-  return tasks.value.find(task => task.agent === agent.key)
+  return tasks.value.find(task => task.id === agent.taskId) || tasks.value.find(task => task.agent === agent.key)
 }
 const complete = computed(() => tasks.value.filter(task => task.status === 'passed').length)
 const acceptanceTask = computed(() => tasks.value.find(task => task.stage === 'acceptance'))
@@ -40,17 +39,14 @@ const apiContract = computed(() => {
   return ''
 })
 const nodeMessages = computed(() => selected.value ? messages.value.filter(message => message.task_id === selectedTask.value?.id || messageFrom(message) === selected.value.key || messageTo(message) === selected.value.key).slice(-8) : [])
+const taskNode = task => ({ key:task.id, taskId:task.id, agentKey:task.agent, name:stageNames[task.stage] || task.agent, role:task.stage })
 const displayAgents = computed(() => {
-  const active = agents.value.filter(agent => tasks.value.some(task => task.agent === agent.key))
-  const lead = active.some(agent => /team[-_]?lead/.test(agent.key))
-  const gate = active.some(agent => /contract.*audit|audit.*contract/.test(agent.key))
-  return [...(lead ? [] : [virtualNodes[0]]), ...(gate ? [] : [virtualNodes[1]]), ...active]
+  return tasks.value.map(taskNode)
 })
-const position = (agent, index) => { const saved = meta[agent.key]; return saved ? { left:saved[2]+'%', top:saved[3]+'%' } : { left:(8+(index%3)*29)+'%', top:(10+Math.floor(index/3)*25)+'%' } }
-const color = agent => meta[agent.key]?.[1] || '#64748b'
-const label = agent => meta[agent.key]?.[0] || agent.name
-const taskAgent = task => agents.value.find(agent => agent.key === task.agent) || { key:task.agent, name:task.agent }
-const endpoint = task => { const point = position(taskAgent(task), 0); return [Number.parseFloat(point.left)+8, Number.parseFloat(point.top)+8] }
+const position = (agent, index) => { const saved = stagePositions[currentTask(agent)?.stage] || meta[agent.agentKey || agent.key]?.slice(2); return saved ? { left:saved[0]+'%', top:saved[1]+'%' } : { left:(8+(index%3)*29)+'%', top:(10+Math.floor(index/3)*25)+'%' } }
+const color = agent => meta[agent.agentKey || agent.key]?.[1] || '#64748b'
+const label = agent => stageNames[currentTask(agent)?.stage] || meta[agent.key]?.[0] || agent.name
+const endpoint = task => { const point = position(taskNode(task), 0); return [Number.parseFloat(point.left)+8, Number.parseFloat(point.top)+8] }
 const wireLinks = computed(() => tasks.value.flatMap(task => task.depends_on.map(parent => ({ task, parent:tasks.value.find(item => item.stage === parent) })).filter(link => link.parent)))
 const date = value => new Intl.DateTimeFormat('zh-CN', { year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }).format(new Date(value)).replace(',', ' /')
 const statusText = status => ({ ready:'待执行', running:'执行中', repairing:'修复中', acceptance_pending_human:'等待人工验收', passed:'已交付', blocked:'等待依赖', skipped:'已跳过', not_applicable:'不适用', waiting:'等待方案' }[status] || status || '等待方案')
@@ -124,7 +120,7 @@ onUnmounted(() => clearInterval(timer))
         <span class="floor-title">A2A WORKSPACE · 上下文从 agent 到 agent 直接流转</span>
         <svg class="wire"><line v-for="link in wireLinks" :key="link.task.id + link.parent.id" :x1="endpoint(link.parent)[0]+'%'" :y1="endpoint(link.parent)[1]+'%'" :x2="endpoint(link.task)[0]+'%'" :y2="endpoint(link.task)[1]+'%'" /></svg>
         <article v-for="(agent, index) in displayAgents" :key="agent.key" class="agent" :class="{ active:selected?.key === agent.key }" :style="{ ...position(agent,index), '--accent':color(agent) }" @click.stop="select(agent,$event)">
-          <div class="agent-head"><i class="avatar">{{ label(agent)[0] }}<em :class="currentTask(agent)?.status"></em></i><div><b>{{ label(agent) }}</b><span>{{ agent.key }}</span></div></div>
+          <div class="agent-head"><i class="avatar">{{ label(agent)[0] }}<em :class="currentTask(agent)?.status"></em></i><div><b>{{ label(agent) }}</b><span>{{ agent.agentKey || agent.key }}</span></div></div>
           <p>{{ currentTask(agent)?.status === 'repairing' ? currentTask(agent)?.detail?.instructions : (currentTask(agent)?.stage || agent.role) + ' · ' + statusText(currentTask(agent)?.status) }}</p><div class="bar"><i :style="{ width: currentTask(agent)?.status === 'passed' ? '100%' : currentTask(agent)?.status === 'repairing' ? '82%' : currentTask(agent)?.status === 'running' ? '72%' : currentTask(agent)?.status === 'ready' ? '58%' : '0%' }"></i></div>
         </article>
         <aside v-if="selected" class="detail" :style="detailStyle" @click.stop><button @click="selected = null">×</button><h3>{{ label(selected) }}</h3><p>Agent ID：{{ selected.key }}</p><p>Task ID：{{ selectedTask?.id || '待 Team Lead 分派' }}</p><p>执行状态：{{ statusText(selectedTask?.status) }}</p><section><h4>正在做什么</h4><p>{{ taskDescription }}</p></section><section v-if="apiContract"><h4>REST API Contract</h4><pre>{{ apiContract }}</pre></section><section v-if="steps.length"><h4>执行步骤 / 日志</h4><ol><li v-for="(step, index) in steps" :key="index">{{ typeof step === 'string' ? step : step.detail || step.text || step.name || JSON.stringify(step) }}</li></ol></section><section v-if="artifacts.length"><h4>{{ deliveryEvidence.length ? '计划交付物 / 对应证据' : '计划交付物（尚未记录交付证据）' }}</h4><ul><li v-for="(artifact, index) in artifacts" :key="index">{{ typeof artifact === 'string' ? artifact : artifact.name || artifact.path || JSON.stringify(artifact) }}</li></ul></section><section v-if="deliveryEvidence.length"><h4>实际交付证据</h4><p v-for="(item, index) in deliveryEvidence" :key="index" class="message">{{ item.detail }}</p></section><section v-if="nodeMessages.length"><h4>协作消息</h4><p v-for="message in nodeMessages" :key="message.id" class="message">{{ label(agents.find(agent => agent.key === messageFrom(message)) || { key:messageFrom(message), name:messageFrom(message) }) }}：{{ message.text }}</p></section><p v-if="selected.key === 'contract-audit'" class="hint">未通过前，前端与后端不会被分派。</p></aside>

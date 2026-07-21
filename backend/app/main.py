@@ -186,6 +186,7 @@ DEFAULT_STAGES = [
     ("backend", "backend-agent", "product"),
     ("audit", "audit-agent", "frontend,backend"),
     ("test", "test-agent", "audit"),
+    ("document_review", "product-agent", "team_lead"),
     ("acceptance", "product-agent", "test"),
     ("deploy", "deployment-agent", "acceptance"),
 ]
@@ -225,10 +226,14 @@ TEAM_WORKFLOW_VALIDATION = [
     ("workflow_validation", "test-agent", "team_lead"),
     ("acceptance", "product-agent", "workflow_validation"),
 ]
+TEAM_DOCUMENTATION = [
+    ("document_review", "product-agent", "team_lead"),
+    ("acceptance", "product-agent", "document_review"),
+]
 MAX_TASK_ITERATIONS = 3
 MAX_REPEAT_MESSAGES = 3
 RECENT_MESSAGES = 12
-WORKER_JOB_TYPES = {"team_lead", "contract_audit", "frontend", "backend", "audit", "test", "workflow_validation"}
+WORKER_JOB_TYPES = {"team_lead", "contract_audit", "frontend", "backend", "audit", "test", "workflow_validation", "document_review"}
 WORKER_LEASE_SECONDS = 60
 
 # There is no Alembic project yet. Keep the compatibility migration explicit
@@ -259,6 +264,9 @@ SCHEMA_MIGRATIONS = {
 
 def route_for(request: str):
     normalized = request.replace(" ", "")
+    is_documentation = any(flag in normalized.lower() for flag in ("prd", "产品需求文档", "需求文档", "流程文档", "文档评审"))
+    if is_documentation:
+        return "documentation", TEAM_DOCUMENTATION
     is_flow_validation = "a2a" in normalized.lower() and any(flag in normalized for flag in ("验证", "自检", "流程测试", "流程验收"))
     if is_flow_validation:
         return "workflow_validation", TEAM_WORKFLOW_VALIDATION
@@ -400,15 +408,25 @@ def task_detail(stage: str, workflow: Workflow, route: str):
         {"operation": "POST /api/v1/resources", "purpose": "创建资源", "request": '{"name": "string"}', "response": "201 + resource"},
         {"operation": "PATCH /api/v1/resources/{id}", "purpose": "更新资源", "request": '{"name": "string", "status": "active|inactive"}', "response": "200 + resource"},
     ]
+    lead_detail = ("澄清需求并输出可审计的实施边界与 REST API Contract；开发任务在方案审计通过前不得启动。",
+                   ["确认范围：" + workflow.request, "定义前后端并行边界与验收条件", "输出 REST API Contract，等待方案审计"],
+                   [{"name": "REST API Contract", "type": "api_contract", "content": contract}, {"name": "验收标准", "type": "acceptance", "content": ["接口字段与状态枚举一致", "前端可使用 Mock 完成独立开发", "真实 API 接入后通过集成测试"]}],
+                   "将方案、接口契约及风险交给方案审计 Agent。")
+    if route == "documentation":
+        lead_detail = ("梳理文档目标、读者、范围、流程、角色和验收标准，产出可供团队直接阅读的 PRD。",
+                       ["确认文档读者与使用场景：" + workflow.request, "整理主流程、异常分支和职责边界", "输出 PRD 草案，等待文档评审"],
+                       [{"name": "PRD 草案", "type": "document", "content": ["产品目标", "流程与角色", "边界与验收标准"]}],
+                       "将 PRD 草案交给文档评审 Agent。")
     details = {
-        "team_lead": ("澄清需求并输出可审计的实施边界与 REST API Contract；开发任务在方案审计通过前不得启动。",
-                      ["确认范围：" + workflow.request, "定义前后端并行边界与验收条件", "输出 REST API Contract，等待方案审计"],
-                      [{"name": "REST API Contract", "type": "api_contract", "content": contract}, {"name": "验收标准", "type": "acceptance", "content": ["接口字段与状态枚举一致", "前端可使用 Mock 完成独立开发", "真实 API 接入后通过集成测试"]}],
-                      "将方案、接口契约及风险交给方案审计 Agent。"),
+        "team_lead": lead_detail,
         "contract_audit": ("审查 Team Lead 的需求边界、API 风格、字段完整性和前后端并行可行性。",
                            ["检查 REST 命名、状态码和错误响应", "检查请求/响应字段是否足够前端 Mock", "通过后释放开发任务"],
                            [{"name": "Contract 审核清单", "type": "review", "content": ["路径使用复数资源名", "写操作返回明确状态码", "字段、枚举、错误场景可实现"]}],
                            "通过后向前端和后端发送已审核 Contract。"),
+        "document_review": ("审阅 PRD 或流程文档的目标、范围、角色、流程、边界和验收标准，确保同事可直接理解和使用。",
+                            ["核对文档是否说明目标读者和业务背景", "核对流程、角色、异常分支与验收标准", "输出可读性和缺漏审阅结论"],
+                            [{"name": "文档评审清单", "type": "review", "content": ["目标与范围明确", "流程与角色完整", "异常与验收可执行", "术语与示例可理解"]}],
+                            "通过后将文档评审结论交给人工验收。"),
         "frontend": ("按审核通过的 Contract 使用 Mock 开发页面；真实 API 可用后完成 Mock 到 API 的切换。",
                      ["依据 Contract 定义前端类型和 Mock", "实现页面、加载、空态和错误态", "接入真实 API 并回归"],
                      [{"name": "前端交付", "type": "implementation", "content": ["页面与交互", "Mock 数据适配器", "API 接入检查"]}],
@@ -569,12 +587,13 @@ def create_workflow(payload: dict, session: Session = Depends(db)):
     if engine_name not in {"langgraph_v1", "node_legacy"}:
         raise HTTPException(422, "unsupported engine")
     workflow_id = "wf_" + uuid4().hex[:8]
+    route, stages = route_for(payload["request"])
+    context_summary = "等待 Team Lead 产出 PRD 草案。" if route == "documentation" else "等待 Team Lead 产出方案与 REST API Contract。"
     workflow = Workflow(id=workflow_id, thread_id=workflow_id, engine=engine_name,
                         graph_version=payload.get("graph_version", GRAPH_VERSION), state_schema_version=1,
-                        title=payload["title"], request=payload["request"], context_summary="等待 Team Lead 产出方案与 REST API Contract。")
+                        title=payload["title"], request=payload["request"], context_summary=context_summary)
     session.add(workflow)
-    route, stages = route_for(payload["request"])
-    lead_gate = [LEAD_GATE[0]] if route == "workflow_validation" else LEAD_GATE
+    lead_gate = [LEAD_GATE[0]] if route in {"workflow_validation", "documentation"} else LEAD_GATE
     for key, agent, dependencies in lead_gate + stages:
         detail = task_detail(key, workflow, route)
         session.add(Task(id=f"{workflow_id}_{key}", workflow_id=workflow_id, stage_key=key, agent_key=agent,

@@ -1,15 +1,18 @@
 import os
 import json
 import hashlib
+import hmac
+import base64
 import logging
+import subprocess
 from pathlib import Path
 from threading import Event, Thread
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import DateTime, String, UniqueConstraint, create_engine, select, text as sql
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, create_engine, select, text as sql
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from langgraph.checkpoint.postgres import PostgresSaver
 
@@ -84,6 +87,48 @@ class AgentRuntime(Base):
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class RunnerBinding(Base):
+    """Server-owned execution boundary. Clients can only attest to its id."""
+    __tablename__ = "runner_bindings"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(40))
+    task_id: Mapped[str] = mapped_column(String(80))
+    attempt_id: Mapped[int] = mapped_column()
+    contract_sha256: Mapped[str] = mapped_column(String(64))
+    repository_root: Mapped[str] = mapped_column(Text)
+    worktree_path: Mapped[str] = mapped_column(Text)
+    branch: Mapped[str] = mapped_column(String(240))
+    base_commit: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+
+
+class IdempotencyReceipt(Base):
+    __tablename__ = "runner_idempotency_receipts"
+    __table_args__ = (UniqueConstraint("actor_id", "endpoint", "idempotency_key", name="uq_runner_receipt_actor_endpoint_key"),)
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(160))
+    endpoint: Mapped[str] = mapped_column(String(240))
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    status_code: Mapped[int] = mapped_column(Integer)
+    response_payload: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
+
+
+class EvidenceReceipt(Base):
+    __tablename__ = "runner_evidence_receipts"
+    __table_args__ = (UniqueConstraint("job_id", "callback_id", name="uq_runner_evidence_callback"),)
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(80))
+    attempt_id: Mapped[int] = mapped_column()
+    lease_version: Mapped[int] = mapped_column()
+    callback_id: Mapped[str] = mapped_column(String(160))
+    outcome: Mapped[str] = mapped_column(String(20))
+    evidence: Mapped[str] = mapped_column(Text)
+    binding_id: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=sql("CURRENT_TIMESTAMP"))
 
 
 class Task(Base):
@@ -264,6 +309,11 @@ RECENT_MESSAGES = 12
 WORKER_JOB_TYPES = {"team_lead", "contract_audit", "frontend", "backend", "audit", "test", "workflow_validation", "document_review"}
 WORKER_LEASE_SECONDS = 60
 AGENT_RUNTIME_TTL_SECONDS = 90
+RUNNER_HEARTBEAT_SECONDS = 15
+RUNNER_ADAPTER = "codex_cli"
+RUNNER_ENDPOINTS = {
+    "runtime:register", "runtime:heartbeat", "job:claim", "job:heartbeat", "job:callback", "job:reap",
+}
 
 # There is no Alembic project yet. Keep the compatibility migration explicit
 # and idempotent until the project adopts a real migration revision chain.
@@ -295,6 +345,12 @@ SCHEMA_MIGRATIONS = {
         "ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS runtime_id VARCHAR(80) NOT NULL DEFAULT ''",
         "UPDATE worker_jobs AS job SET required_agent_key = task.agent_key FROM workflow_tasks AS task WHERE job.task_id = task.id AND job.required_agent_key = ''",
     ),
+    "20260721_codex_cli_runner": (
+        "CREATE TABLE IF NOT EXISTS runner_bindings (id VARCHAR(80) PRIMARY KEY, workflow_id VARCHAR(40) NOT NULL, task_id VARCHAR(80) NOT NULL, attempt_id INTEGER NOT NULL, contract_sha256 VARCHAR(64) NOT NULL, repository_root TEXT NOT NULL, worktree_path TEXT NOT NULL, branch VARCHAR(240) NOT NULL, base_commit VARCHAR(80) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT uq_runner_binding_attempt UNIQUE(workflow_id, task_id, attempt_id))",
+        "CREATE TABLE IF NOT EXISTS runner_idempotency_receipts (id VARCHAR(80) PRIMARY KEY, actor_id VARCHAR(160) NOT NULL, endpoint VARCHAR(240) NOT NULL, idempotency_key VARCHAR(200) NOT NULL, request_sha256 VARCHAR(64) NOT NULL, status_code INTEGER NOT NULL, response_payload TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT uq_runner_receipt_actor_endpoint_key UNIQUE(actor_id, endpoint, idempotency_key))",
+        "CREATE TABLE IF NOT EXISTS runner_evidence_receipts (id VARCHAR(80) PRIMARY KEY, job_id VARCHAR(80) NOT NULL, attempt_id INTEGER NOT NULL, lease_version INTEGER NOT NULL, callback_id VARCHAR(160) NOT NULL, outcome VARCHAR(20) NOT NULL, evidence TEXT NOT NULL, binding_id VARCHAR(80) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT uq_runner_evidence_callback UNIQUE(job_id, callback_id))",
+        "CREATE INDEX IF NOT EXISTS ix_runner_binding_workflow_task ON runner_bindings(workflow_id, task_id, attempt_id)",
+    ),
 }
 
 
@@ -322,6 +378,98 @@ def decode(value: str):
 
 def payload_hash(value: str):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def canonical_json(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def migration_checksum(statements: tuple[str, ...]) -> str:
+    return payload_hash("\n".join(statements))
+
+
+def runner_error(status_code: int, code: str, message: str):
+    raise HTTPException(status_code, {"code": code, "message": message, "request_id": uuid4().hex})
+
+
+def jwt_claims(authorization: str, required_scope: str) -> dict:
+    """Minimal HS256 JWT verifier; issuer provisions short lived worker/service tokens."""
+    if not authorization.startswith("Bearer "):
+        runner_error(401, "unauthorized", "Bearer token is required")
+    try:
+        token = authorization[7:]
+        head, body, signature = token.split(".")
+        secret = os.environ["A2A_RUNNER_JWT_SECRET"].encode()
+        expected = base64.urlsafe_b64encode(hmac.new(secret, f"{head}.{body}".encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+        if not hmac.compare_digest(expected, signature):
+            runner_error(401, "unauthorized", "invalid token signature")
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (KeyError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        runner_error(401, "unauthorized", "invalid token")
+    if int(claims.get("exp", 0)) <= int(datetime.now(timezone.utc).timestamp()):
+        runner_error(401, "unauthorized", "expired token")
+    if required_scope not in set(claims.get("scopes", [])):
+        runner_error(403, "forbidden", "token scope is insufficient")
+    return claims
+
+
+def receipt(session: Session, actor_id: str, endpoint: str, key: str, payload: dict):
+    if not key:
+        runner_error(422, "validation_error", "Idempotency-Key is required")
+    digest = payload_hash(canonical_json(payload))
+    prior = session.scalar(select(IdempotencyReceipt).where(IdempotencyReceipt.actor_id == actor_id,
+                           IdempotencyReceipt.endpoint == endpoint, IdempotencyReceipt.idempotency_key == key))
+    if not prior:
+        return None, digest
+    if prior.request_sha256 != digest:
+        runner_error(409, "idempotency_conflict", "Idempotency-Key was reused with a different request")
+    return json.loads(prior.response_payload), digest
+
+
+def save_receipt(session: Session, actor_id: str, endpoint: str, key: str, digest: str, response: dict, status=200):
+    session.add(IdempotencyReceipt(id="receipt_" + uuid4().hex, actor_id=actor_id, endpoint=endpoint,
+                idempotency_key=key, request_sha256=digest, status_code=status, response_payload=canonical_json(response)))
+
+
+def authorized(claims: dict, runtime: AgentRuntime, *, workflow_id="", task_id=""):
+    if claims.get("worker_id") != runtime.worker_id or claims.get("agent_key") != runtime.agent_key:
+        runner_error(403, "forbidden", "token does not own this runtime")
+    if workflow_id and workflow_id not in set(claims.get("workflow_ids", [])):
+        runner_error(403, "forbidden", "workflow is not authorized")
+    if task_id and task_id not in set(claims.get("task_ids", [])):
+        runner_error(403, "forbidden", "task is not authorized")
+
+
+def server_binding(session: Session, workflow_id: str, task_id: str, attempt_id: int) -> RunnerBinding:
+    existing = session.scalar(select(RunnerBinding).where(RunnerBinding.workflow_id == workflow_id,
+                               RunnerBinding.task_id == task_id, RunnerBinding.attempt_id == attempt_id))
+    if existing:
+        return existing
+    root = Path(os.environ.get("A2A_REPOSITORY_ROOT", Path(__file__).resolve().parents[2])).resolve(strict=True)
+    task = session.get(Task, task_id)
+    workflow = session.get(Workflow, workflow_id)
+    if not task or not workflow:
+        runner_error(404, "not_found", "workflow task not found")
+    branch = f"a2a/{workflow_id}/{task_id}/attempt-{attempt_id}"
+    worktree = (root / ".a2a-worktrees" / workflow_id / task_id / f"attempt-{attempt_id}").resolve()
+    if root not in worktree.parents:
+        runner_error(409, "binding_conflict", "derived worktree escapes repository root")
+    base_commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    if not worktree.exists():
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(root), "worktree", "add", "-b", branch, str(worktree), base_commit], check=True, capture_output=True, text=True)
+    resolved = worktree.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        runner_error(409, "binding_conflict", "resolved worktree escapes repository root")
+    snapshot = {"workflow_id": workflow_id, "task_id": task_id, "attempt_id": attempt_id,
+                "instructions": task.instructions, "branch": branch, "base_commit": base_commit}
+    binding = RunnerBinding(id="binding_" + uuid4().hex, workflow_id=workflow_id, task_id=task_id,
+                attempt_id=attempt_id, contract_sha256=payload_hash(canonical_json(snapshot)), repository_root=str(root),
+                worktree_path=str(resolved), branch=branch, base_commit=base_commit)
+    session.add(binding)
+    return binding
 
 
 def event_response(session: Session, workflow_id: str, idempotency_key: str):
@@ -548,13 +696,19 @@ def boot():
     global checkpointer_context, checkpointer, runtime_reaper_thread
     Base.metadata.create_all(engine)
     with Local() as session:
-        session.execute(sql("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(80) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
-        applied = set(session.scalars(sql("SELECT version FROM schema_migrations")).all())
+        session.execute(sql("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(80) PRIMARY KEY, checksum VARCHAR(64) NOT NULL DEFAULT '', applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
+        session.execute(sql("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum VARCHAR(64) NOT NULL DEFAULT ''"))
+        applied = {row[0]: row[1] for row in session.execute(sql("SELECT version, checksum FROM schema_migrations"))}
         for version, statements in SCHEMA_MIGRATIONS.items():
+            checksum = migration_checksum(statements)
             if version not in applied:
                 for statement in statements:
                     session.execute(sql(statement))
-                session.execute(sql("INSERT INTO schema_migrations (version) VALUES (:version)"), {"version": version})
+                session.execute(sql("INSERT INTO schema_migrations (version, checksum) VALUES (:version, :checksum)"), {"version": version, "checksum": checksum})
+            elif applied[version] not in {"", checksum}:
+                raise RuntimeError(f"migration checksum mismatch: {version}")
+            elif not applied[version]:
+                session.execute(sql("UPDATE schema_migrations SET checksum = :checksum WHERE version = :version"), {"version": version, "checksum": checksum})
         # Existing rows predate the graph runtime. New workflows explicitly set
         # their own thread_id and engine in create_workflow().
         session.execute(sql("UPDATE workflows SET engine = 'python_legacy' WHERE thread_id = ''"))
@@ -657,7 +811,7 @@ def agent_runtimes(session: Session = Depends(db)):
     return [runtime_data(session, item) for item in session.scalars(select(AgentRuntime).order_by(AgentRuntime.updated_at.desc()))]
 
 
-@app.post("/api/agent-runtimes/register")
+@app.post("/internal/agent-runtimes/register", include_in_schema=False)
 def register_agent_runtime(payload: dict, session: Session = Depends(db)):
     runtime_id = str(payload.get("runtime_id", "")).strip()
     agent_key = str(payload.get("agent_key", "")).strip()
@@ -687,7 +841,7 @@ def register_agent_runtime(payload: dict, session: Session = Depends(db)):
     return runtime_data(session, runtime)
 
 
-@app.post("/api/agent-runtimes/{runtime_id}/heartbeat")
+@app.post("/internal/agent-runtimes/{runtime_id}/heartbeat", include_in_schema=False)
 def runtime_heartbeat(runtime_id: str, payload: dict, session: Session = Depends(db)):
     runtime = session.get(AgentRuntime, runtime_id)
     if not runtime or runtime.worker_id != str(payload.get("worker_id", "")).strip():
@@ -1050,6 +1204,144 @@ def active_lease(job: WorkerJob, worker_id: str, attempt_id: int, lease_version:
             and job.status in {"leased", "running"} and job.lease_expires_at and job.lease_expires_at > datetime.now(timezone.utc))
 
 
+def binding_data(binding: RunnerBinding):
+    return {"id": binding.id, "contract_sha256": binding.contract_sha256, "repository_root": binding.repository_root,
+            "worktree_path": binding.worktree_path, "branch": binding.branch, "base_commit": binding.base_commit}
+
+
+def require_evidence(value):
+    if not isinstance(value, dict) or set(value) != {"command", "exit_code", "stdout_summary", "stderr_summary", "started_at", "finished_at", "artifacts", "tests"}:
+        runner_error(422, "validation_error", "evidence fields are invalid")
+    if not isinstance(value["command"], str) or len(value["command"]) > 4096 or not isinstance(value["exit_code"], int):
+        runner_error(422, "validation_error", "evidence command or exit_code is invalid")
+    for field in ("stdout_summary", "stderr_summary"):
+        if not isinstance(value[field], str) or len(value[field]) > 16384:
+            runner_error(422, "validation_error", f"evidence {field} is invalid")
+    for field in ("started_at", "finished_at"):
+        try:
+            parsed = datetime.fromisoformat(value[field].replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0): raise ValueError()
+        except (AttributeError, ValueError):
+            runner_error(422, "validation_error", f"evidence {field} must be RFC3339 UTC")
+    if not isinstance(value["artifacts"], list) or len(value["artifacts"]) > 50 or not isinstance(value["tests"], list) or len(value["tests"]) > 100:
+        runner_error(422, "validation_error", "evidence list limits exceeded")
+    for artifact in value["artifacts"]:
+        if set(artifact) != {"name", "kind", "sha256", "size_bytes", "relative_path"} or not isinstance(artifact["name"], str) or len(artifact["name"]) > 255 or artifact["kind"] not in {"log", "report", "patch", "binary"} or not isinstance(artifact["sha256"], str) or not __import__("re").fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) or not isinstance(artifact["size_bytes"], int) or not 0 <= artifact["size_bytes"] <= 52428800 or not isinstance(artifact["relative_path"], str) or len(artifact["relative_path"]) > 1024:
+            runner_error(422, "validation_error", "artifact is invalid")
+    for test in value["tests"]:
+        if set(test) != {"name", "status", "duration_ms", "summary"} or not isinstance(test["name"], str) or len(test["name"]) > 255 or test["status"] not in {"passed", "failed", "skipped"} or not isinstance(test["duration_ms"], int) or test["duration_ms"] < 0 or not isinstance(test["summary"], str) or len(test["summary"]) > 4096:
+            runner_error(422, "validation_error", "test evidence is invalid")
+
+
+@app.post("/api/v1/agent-runtimes/register", status_code=201)
+def v1_register_runtime(payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "runtime:register")
+    runtime_id, agent_key = str(payload.get("runtime_id", "")).strip(), str(payload.get("agent_key", "")).strip()
+    if not runtime_id or agent_key != claims.get("agent_key") or not session.scalar(select(Agent).where(Agent.key == agent_key)):
+        runner_error(422, "validation_error", "runtime_id or agent_key is invalid")
+    replay, digest = receipt(session, claims["worker_id"], "/api/v1/agent-runtimes/register", idempotency_key, payload)
+    if replay: return replay
+    job = session.scalar(select(WorkerJob).where(WorkerJob.status == "queued", WorkerJob.workflow_id.in_(claims.get("workflow_ids", [])), WorkerJob.task_id.in_(claims.get("task_ids", [])), WorkerJob.required_agent_key == agent_key).order_by(WorkerJob.created_at))
+    if not job: runner_error(409, "binding_conflict", "no authorized queued job is available for binding")
+    binding = server_binding(session, job.workflow_id, job.task_id, job.attempt_id)
+    runtime = session.get(AgentRuntime, runtime_id)
+    if runtime and (runtime.worker_id != claims["worker_id"] or runtime.current_job_id): runner_error(409, "binding_conflict", "runtime is owned or busy")
+    if not runtime:
+        runtime = AgentRuntime(id=runtime_id, agent_key=agent_key, adapter=RUNNER_ADAPTER, worker_id=claims["worker_id"]); session.add(runtime)
+    runtime.adapter, runtime.session_ref, runtime.worktree_path, runtime.state, runtime.last_heartbeat_at = RUNNER_ADAPTER, str(payload.get("session_ref", ""))[:200], binding.worktree_path, "idle", datetime.now(timezone.utc)
+    response = {"runtime_id": runtime_id, "state": "idle", "binding": binding_data(binding), "next_heartbeat_seconds": RUNNER_HEARTBEAT_SECONDS}
+    save_receipt(session, claims["worker_id"], "/api/v1/agent-runtimes/register", idempotency_key, digest, response, 201); session.commit(); return response
+
+
+@app.post("/api/v1/agent-runtimes/{runtime_id}/heartbeat")
+def v1_runtime_heartbeat(runtime_id: str, payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "runtime:heartbeat"); runtime = session.get(AgentRuntime, runtime_id)
+    if not runtime: runner_error(404, "not_found", "runtime not found")
+    authorized(claims, runtime); replay, digest = receipt(session, claims["worker_id"], f"/api/v1/agent-runtimes/{runtime_id}/heartbeat", idempotency_key, payload)
+    if replay: return replay
+    runtime.last_heartbeat_at = datetime.now(timezone.utc)
+    response = {"runtime_id": runtime.id, "state": runtime.state, "next_heartbeat_seconds": RUNNER_HEARTBEAT_SECONDS}
+    save_receipt(session, claims["worker_id"], f"/api/v1/agent-runtimes/{runtime_id}/heartbeat", idempotency_key, digest, response); session.commit(); return response
+
+
+@app.post("/api/v1/worker/jobs/claim")
+def v1_claim_job(payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "job:claim"); runtime = session.get(AgentRuntime, str(payload.get("runtime_id", "")).strip())
+    if not runtime: runner_error(404, "not_found", "runtime not found")
+    authorized(claims, runtime); endpoint = "/api/v1/worker/jobs/claim"; replay, digest = receipt(session, claims["worker_id"], endpoint, idempotency_key, payload)
+    if replay: return replay
+    if runtime.adapter != RUNNER_ADAPTER or not runtime_is_live(runtime) or runtime.current_job_id: runner_error(409, "lease_conflict", "runtime is offline, busy, or not codex_cli")
+    statement = select(WorkerJob).where(WorkerJob.status == "queued", WorkerJob.required_agent_key == runtime.agent_key,
+        WorkerJob.workflow_id.in_(claims.get("workflow_ids", [])), WorkerJob.task_id.in_(claims.get("task_ids", [])))
+    if payload.get("workflow_id"): statement = statement.where(WorkerJob.workflow_id == str(payload["workflow_id"]))
+    if payload.get("job_id"): statement = statement.where(WorkerJob.id == str(payload["job_id"]))
+    job = session.scalar(statement.order_by(WorkerJob.created_at).with_for_update(skip_locked=True))
+    if not job:
+        response = {"job": None}; save_receipt(session, claims["worker_id"], endpoint, idempotency_key, digest, response); session.commit(); return response
+    binding = server_binding(session, job.workflow_id, job.task_id, job.attempt_id)
+    job.worker_id, job.runtime_id, job.lease_version, job.status = runtime.worker_id, runtime.id, job.lease_version + 1, "leased"
+    job.heartbeat_at = datetime.now(timezone.utc); job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
+    task = session.get(Task, job.task_id); task.status, task.lease_version, task.worker_session_id = "running", job.lease_version, runtime.worker_id
+    runtime.state, runtime.current_job_id, runtime.worktree_path = "working", job.id, binding.worktree_path
+    response = {"job": {"id": job.id, "workflow_id": job.workflow_id, "task_id": job.task_id, "attempt_id": job.attempt_id, "lease_version": job.lease_version, "lease_expires_at": job.lease_expires_at.isoformat(), "instructions": task.instructions, "binding": binding_data(binding)}}
+    save_receipt(session, claims["worker_id"], endpoint, idempotency_key, digest, response); session.commit(); return response
+
+
+def v1_active_job(session, claims, job_id, payload, scope):
+    job = session.get(WorkerJob, job_id); runtime = session.get(AgentRuntime, str(payload.get("runtime_id", "")).strip())
+    if not job or not runtime: runner_error(404, "not_found", "job or runtime not found")
+    authorized(claims, runtime, workflow_id=job.workflow_id, task_id=job.task_id)
+    if job.runtime_id != runtime.id or not active_lease(job, runtime.worker_id, int(payload.get("attempt_id", -1)), int(payload.get("lease_version", -1))): runner_error(409, "stale_lease", "lease is stale or expired")
+    return job, runtime
+
+
+@app.post("/api/v1/worker/jobs/{job_id}/heartbeat")
+def v1_job_heartbeat(job_id: str, payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "job:heartbeat"); job, runtime = v1_active_job(session, claims, job_id, payload, "job:heartbeat")
+    endpoint = f"/api/v1/worker/jobs/{job_id}/heartbeat"; replay, digest = receipt(session, claims["worker_id"], endpoint, idempotency_key, payload)
+    if replay: return replay
+    job.status, job.heartbeat_at, runtime.last_heartbeat_at = "running", datetime.now(timezone.utc), datetime.now(timezone.utc); job.lease_expires_at = job.heartbeat_at + timedelta(seconds=WORKER_LEASE_SECONDS)
+    response = {"job_id": job.id, "lease_expires_at": job.lease_expires_at.isoformat(), "next_heartbeat_seconds": RUNNER_HEARTBEAT_SECONDS}
+    save_receipt(session, claims["worker_id"], endpoint, idempotency_key, digest, response); session.commit(); return response
+
+
+@app.post("/api/v1/worker/jobs/reap-expired")
+def v1_reap_expired(payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "job:reap"); endpoint = "/api/v1/worker/jobs/reap-expired"; replay, digest = receipt(session, claims["worker_id"], endpoint, idempotency_key, payload)
+    if replay: return replay
+    count = reap_expired(session); response = {"requeued": count}; save_receipt(session, claims["worker_id"], endpoint, idempotency_key, digest, response); session.commit(); return response
+
+
+@app.post("/api/v1/worker/jobs/{job_id}/callback")
+def v1_callback(job_id: str, payload: dict, authorization: str = Header(default=""), idempotency_key: str = Header(default=""), session: Session = Depends(db)):
+    claims = jwt_claims(authorization, "job:callback"); job = session.get(WorkerJob, job_id)
+    if not job: runner_error(404, "not_found", "job not found")
+    callback_id = str(payload.get("callback_id", "")).strip()
+    if not callback_id: runner_error(422, "validation_error", "callback_id is required")
+    existing = session.scalar(select(EvidenceReceipt).where(EvidenceReceipt.job_id == job_id, EvidenceReceipt.callback_id == callback_id))
+    if existing:
+        if existing.evidence != canonical_json(payload.get("evidence", {})): runner_error(409, "callback_conflict", "callback_id payload differs")
+        return {"job_id": job_id, "status": existing.outcome, "evidence_receipt_id": existing.id}
+    runtime = session.get(AgentRuntime, str(payload.get("runtime_id", "")).strip())
+    if not runtime: runner_error(404, "not_found", "runtime not found")
+    authorized(claims, runtime, workflow_id=job.workflow_id, task_id=job.task_id)
+    endpoint = f"/api/v1/worker/jobs/{job_id}/callback"; replay, digest = receipt(session, claims["worker_id"], endpoint, idempotency_key, payload)
+    if replay: return replay
+    _, runtime = v1_active_job(session, claims, job_id, payload, "job:callback")
+    outcome = str(payload.get("outcome", "")).lower()
+    if outcome not in {"succeeded", "failed"}: runner_error(422, "validation_error", "outcome is invalid")
+    if outcome == "succeeded": require_evidence(payload.get("evidence"))
+    elif not isinstance(payload.get("error"), dict): runner_error(422, "validation_error", "failed callback requires structured error")
+    binding = session.scalar(select(RunnerBinding).where(RunnerBinding.workflow_id == job.workflow_id, RunnerBinding.task_id == job.task_id, RunnerBinding.attempt_id == job.attempt_id))
+    evidence = canonical_json(payload.get("evidence", {})); evidence_receipt = EvidenceReceipt(id="evidence_" + uuid4().hex, job_id=job.id, attempt_id=job.attempt_id, lease_version=job.lease_version, callback_id=callback_id, outcome=outcome, evidence=evidence, binding_id=binding.id); session.add(evidence_receipt)
+    if outcome == "failed": job.status, runtime.state, runtime.current_job_id = "failed", "idle", ""; response = {"job_id": job.id, "status": "failed", "evidence_receipt_id": evidence_receipt.id}
+    else:
+        job.callback_id, job.status, job.lease_expires_at, runtime.state, runtime.current_job_id = callback_id, "callback_pending", None, "idle", ""
+        task_result = complete_task(job.workflow_id, job.task_id, {"worker_session_id": runtime.worker_id, "evidence": canonical_json({"evidence_receipt_id": evidence_receipt.id, "binding": binding_data(binding)}), "idempotency_key": f"runner:{job.id}:{callback_id}"}, session, commit=False)
+        job.status = "succeeded"; response = {"job_id": job.id, "status": "succeeded", "task": task_result, "evidence_receipt_id": evidence_receipt.id}
+    save_receipt(session, claims["worker_id"], endpoint, idempotency_key, digest, response); session.commit(); return response
+
+
 def apply_replan(session: Session, workflow: Workflow, selected_stages: list[str], summary: str):
     """Reopen only the stages selected by Team Lead and their dependent gates."""
     tasks = session.scalars(select(Task).where(Task.workflow_id == workflow.id)).all()
@@ -1090,7 +1382,7 @@ def apply_replan(session: Session, workflow: Workflow, selected_stages: list[str
     return response
 
 
-@app.post("/api/worker/jobs/claim")
+@app.post("/internal/worker/jobs/claim", include_in_schema=False)
 def claim_job(payload: dict, session: Session = Depends(db)):
     worker_id = str(payload.get("worker_id", "")).strip()
     runtime_id = str(payload.get("runtime_id", "")).strip()
@@ -1131,7 +1423,7 @@ def claim_job(payload: dict, session: Session = Depends(db)):
                     "lease_version": job.lease_version, "instructions": task.instructions}}
 
 
-@app.post("/api/worker/jobs/{job_id}/heartbeat")
+@app.post("/internal/worker/jobs/{job_id}/heartbeat", include_in_schema=False)
 def heartbeat(job_id: str, payload: dict, session: Session = Depends(db)):
     job = session.get(WorkerJob, job_id)
     runtime_id = str(payload.get("runtime_id", "")).strip()
@@ -1146,12 +1438,12 @@ def heartbeat(job_id: str, payload: dict, session: Session = Depends(db)):
     return {"job_id": job.id, "lease_expires_at": job.lease_expires_at.isoformat()}
 
 
-@app.post("/api/worker/jobs/reap-expired")
+@app.post("/internal/worker/jobs/reap-expired", include_in_schema=False)
 def reap_expired_jobs(session: Session = Depends(db)):
     return {"requeued": reap_expired(session)}
 
 
-@app.post("/api/worker/jobs/{job_id}/callback")
+@app.post("/internal/worker/jobs/{job_id}/callback", include_in_schema=False)
 def worker_callback(job_id: str, payload: dict, session: Session = Depends(db)):
     job = session.get(WorkerJob, job_id)
     worker_id = str(payload.get("worker_id", ""))
